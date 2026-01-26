@@ -699,9 +699,9 @@ class MainWindow(QMainWindow):
         idx = page_num + self.config['page_offset'] - 1
         
         # PDF
-        if self.doc and 0 <= idx < len(self.doc):
+        if self.doc and 1 <= idx <= len(self.doc):
             try:
-                page = self.doc[idx]
+                page = self.doc[idx-1]
                 pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
                 # PyMuPDF pixmap -> QImage
                 img_format = QImage.Format.Format_RGB888
@@ -728,6 +728,7 @@ class MainWindow(QMainWindow):
     def load_ocr_json(self, page_num):
         """加载 PaddleOCR 格式 JSON"""
         path = self.config['ocr_json_path']
+        page_num += self.config['page_offset'] - 1
         f_path = os.path.join(path, f"page_{page_num}.json")
         if not os.path.exists(f_path):
             # 尝试直接数字
@@ -1073,10 +1074,11 @@ class MainWindow(QMainWindow):
     def run_local_ocr(self):
         if not HAS_LOCAL_OCR: return
         page_num = int(self.spin_page.text())
-        img_path = ""
+        
         
         # 导出当前页面图片为临时文件供 OCR
         pix = self.get_page_pixmap(page_num)
+        
         if not pix:
             QMessageBox.warning(self, "Error", "没有图片可供 OCR")
             return
@@ -1098,6 +1100,7 @@ class MainWindow(QMainWindow):
             # 保存到 json
             save_dir = self.config['ocr_json_path']
             if not os.path.exists(save_dir): os.makedirs(save_dir)
+            page_num += self.config['page_offset'] - 1
             json_path = os.path.join(save_dir, f"page_{page_num}.json")
             
             with open(json_path, "w", encoding='utf-8') as f:
@@ -1128,11 +1131,11 @@ class MainWindow(QMainWindow):
 
         page_num = self.spin_page.text()
         try:
-            p_int = int(page_num)
+            page_num = int(page_num)
         except: return
-        
+
         # 1. Get Image
-        pix = self.get_page_pixmap(p_int)
+        pix = self.get_page_pixmap(page_num)
         if not pix:
             QMessageBox.warning(self, "Error", "No image found for this page.")
             return
@@ -1180,7 +1183,7 @@ class MainWindow(QMainWindow):
             if not save_dir:
                 save_dir = "ocr_results" # default fallback
                 if not os.path.exists(save_dir): os.makedirs(save_dir)
-                
+            page_num += self.config['page_offset'] - 1
             json_path = os.path.join(save_dir, f"page_{page_num}.json")
             with open(json_path, "w", encoding='utf8') as json_file:
                 json.dump(result, json_file, ensure_ascii=False, indent=2)

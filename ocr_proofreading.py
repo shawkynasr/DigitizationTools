@@ -12,8 +12,11 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QMessageBox, QLineEdit, QPushButton, QComboBox, QCheckBox,
                              QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsRectItem)
 from PyQt6.QtGui import (QAction, QColor, QFont, QImage, QPixmap, QPen, QTextCursor, 
-                         QTextCharFormat, QCursor, QTextFormat)
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QEvent
+                         QTextCharFormat, QCursor, QTextFormat, QSyntaxHighlighter)
+from PyQt6.QtWidgets import QProgressBar
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QEvent, QThread, pyqtSlot
+import bisect
+
 
 # ==========================================
 # 0. 全局工具与配置管理
@@ -83,8 +86,105 @@ def write_pages_to_file(pages: dict[int, str], file_path: str):
         print(f"Save error: {e}")
 
 # ==========================================
-# 1. 自定义编辑器 (支持 Diff 交互)
+# 1. 自定义编辑器 (支持 Diff 交互) & Highlighter
 # ==========================================
+
+class DiffSyntaxHighlighter(QSyntaxHighlighter):
+    def __init__(self, document):
+        super().__init__(document)
+        self.diff_ranges = [] # List of tuples (start, end)
+        self.diff_starts = [] # List of start positions for bisect
+        self.regex_pattern = None
+        
+        # 预定义格式
+        self.diff_fmt = QTextCharFormat()
+        self.diff_fmt.setForeground(QColor("red"))
+        self.diff_fmt.setBackground(QColor("#FFEEEE")) # 浅红背景
+        
+        self.regex_fmt = QTextCharFormat()
+        self.regex_fmt.setBackground(QColor("#E0F0FF")) # 浅蓝
+        
+    def set_diff_data(self, opcodes, is_left):
+        self.diff_ranges = []
+        for tag, i1, i2, j1, j2 in opcodes:
+            if tag == 'equal': continue
+            s, e = (i1, i2) if is_left else (j1, j2)
+            if s < e:
+                self.diff_ranges.append((s, e))
+        
+        self.diff_ranges.sort() # Ensure sorted
+        self.diff_starts = [r[0] for r in self.diff_ranges]
+        self.rehighlight()
+        
+    def set_regex(self, regex_str):
+        if not regex_str:
+            self.regex_pattern = None
+        else:
+            try:
+                self.regex_pattern = re.compile(regex_str)
+            except:
+                self.regex_pattern = None
+        self.rehighlight()
+
+    def highlightBlock(self, text):
+        if not self.diff_ranges and not self.regex_pattern: return
+        
+        block = self.currentBlock()
+        block_start = block.position()
+        block_len = len(text)
+        block_end = block_start + block_len
+        
+        # 1. Diff Highlighting (Optimized with Bisect)
+        if self.diff_ranges:
+            # Find range of opcodes that might overlap with this block.
+            # bisect_right returns insertion point after x to maintain order.
+            # Any range starting >= block_end essentially cannot overlap (except edge case empty range? invalid here).
+            end_idx = bisect.bisect_right(self.diff_starts, block_end)
+            
+            # Where to start?
+            # We need to find the first range that ends > block_start.
+            # Since we only have starts list, we can't do exact bisect on ends.
+            # But diffs are usually sequential. The ranges ending before block_start 
+            # likely have start < block_start.
+            # Let's iterate backwards from end_idx or just check a window. 
+            # Or just iterate from 0 to end_idx? If end_idx is huge, bad.
+            # BUT: In a diff, ranges are strictly increasing.
+            # So range[i].end < range[i+1].start usually (unless strictly overlapping... diff opcodes don't overlap).
+            # So we can just bisect_right find the UPPER bound.
+            # And for lower bound:
+            # The range immediately causing overlap could start way before.
+            # But opcodes don't overlap.
+            # So we can look at bisect_right(starts, block_start) - 1.
+            
+            start_search = bisect.bisect_right(self.diff_starts, block_start)
+            if start_search > 0:
+                start_search -= 1 # check the one that started before block
+            
+            # Safety cap
+            count = 0 
+            for i in range(start_search, end_idx):
+                if count > 1000: break # Safety break
+                s, e = self.diff_ranges[i]
+                
+                # Intersect
+                intersect_start = max(s, block_start)
+                intersect_end = min(e, block_end)
+                
+                if intersect_start < intersect_end:
+                    rel_start = intersect_start - block_start
+                    rel_len = intersect_end - intersect_start
+                    self.setFormat(rel_start, rel_len, self.diff_fmt)
+                
+                count += 1
+        
+        # 2. Regex Highlighting
+        if self.regex_pattern:
+            count = 0
+            for match in self.regex_pattern.finditer(text):
+                if count > 100: break 
+                self.setFormat(match.start(), match.end() - match.start(), self.regex_fmt)
+                count += 1
+
 
 class DiffTextEdit(QTextEdit):
     """
@@ -263,6 +363,7 @@ class ImageCanvas(QGraphicsView):
 
     def load_content(self, pixmap, ocr_data=None):
         self.scene.clear()
+        self.highlight_item = None # Fix: Reset C++ object wrapper
         if pixmap:
             self.scene.addPixmap(pixmap)
             self.setSceneRect(0, 0, pixmap.width(), pixmap.height())
@@ -327,7 +428,7 @@ class ImageCanvas(QGraphicsView):
             try:
                 self.scene.removeItem(self.highlight_item)
             except RuntimeError:
-                pass
+                pass # Already deleted by C++
             self.highlight_item = None
             
         if w > 0 and h > 0:
@@ -338,6 +439,135 @@ class ImageCanvas(QGraphicsView):
             self.highlight_item.setZValue(10) # Top layer
             self.scene.addItem(self.highlight_item)
             self.ensure_visible_bbox(x, y, w, h)
+
+
+# ==========================================
+# 2.2 OCR Worker (Async)
+# ==========================================
+
+class OCRWorker(QThread):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(bool, str) # success, message
+    
+    def __init__(self, mode, page_list, config, pdf_path=None):
+        super().__init__()
+        self.mode = mode # 'single' or 'batch'
+        self.page_list = page_list # list of page numbers (int)
+        self.config = config
+        self.pdf_path = pdf_path
+        self._is_running = True
+
+    def run(self):
+        doc = None
+        # Thread-safe PDF opening
+        if self.pdf_path and os.path.exists(self.pdf_path):
+            try:
+                doc = fitz.open(self.pdf_path)
+            except: pass
+            
+        api_url = self.config.get("ocr_api_url")
+        token = self.config.get("ocr_api_token")
+        
+        save_dir = self.config.get("ocr_json_path", "ocr_results")
+        if not os.path.exists(save_dir): 
+            try: os.makedirs(save_dir)
+            except: pass
+            
+        total = len(self.page_list)
+        success_count = 0
+        
+        for i, page_num in enumerate(self.page_list):
+            if not self._is_running: break
+            
+            try:
+                self.progress.emit(f"Processing page {page_num} ({i+1}/{total})...")
+                
+                # 1. Get Image Data (Bytes)
+                img_bytes = None
+                
+                if doc:
+                    try:
+                        idx = page_num + self.config['page_offset'] - 1
+                        if 0 < idx <= len(doc):
+                            page = doc[idx-1]
+                            
+                            # Try Raw
+                            images = page.get_images()
+                            if len(images) == 1:
+                                xref = images[0][0]
+                                base_image = doc.extract_image(xref)
+                                img_bytes = base_image["image"]
+                            else:
+                                # Fallback High DPI
+                                pix = page.get_pixmap(matrix=fitz.Matrix(3.0, 3.0))
+                                img_bytes = pix.tobytes("png")
+                    except: pass
+                    
+                # Try Image Dir if PDF failed
+                if not img_bytes:
+                    img_dir = self.config.get('image_dir')
+                    if img_dir:
+                        names = [f"page_{page_num}", f"{page_num}"]
+                        exts = [".jpg", ".png", ".jpeg"]
+                        for n in names:
+                            for e in exts:
+                                p = os.path.join(img_dir, n + e)
+                                if os.path.exists(p):
+                                    with open(p, "rb") as f:
+                                        img_bytes = f.read()
+                                    break
+                            if img_bytes: break
+                            
+                if not img_bytes:
+                    if self.mode == 'single':
+                        raise Exception(f"No image found for page {page_num}")
+                    else:
+                        continue # Skip in batch
+                
+                # 2. Prepare Request
+                file_data = base64.b64encode(img_bytes).decode("ascii")
+                headers = {
+                    "Authorization": f"token {token}",
+                    "Content-Type": "application/json"
+                }
+                payload = {
+                    "file": file_data,
+                    "fileType": 1,
+                    "useDocOrientationClassify": False,
+                    "useDocUnwarping": False,
+                    "useChartRecognition": False,
+                }
+
+                # 3. Send Request
+                response = requests.post(api_url, json=payload, headers=headers)
+                
+                if response.status_code != 200:
+                    if self.mode == 'single':
+                         raise Exception(f"Remote Error: {response.text}")
+                    else:
+                         print(f"Page {page_num} Error: {response.text}")
+                         continue
+
+                result = response.json().get("result")
+                
+                # 4. Save
+                json_path = os.path.join(save_dir, f"page_{page_num}.json")
+                with open(json_path, "w", encoding='utf8') as json_file:
+                    json.dump(result, json_file, ensure_ascii=False, indent=2)
+                    
+                success_count += 1
+                
+            except Exception as e:
+                if self.mode == 'single':
+                    self.finished.emit(False, str(e))
+                    return
+                print(e)
+                
+        if doc: doc.close()
+        self.finished.emit(True, f"Batch OCR Done. {success_count}/{total} processed.")
+
+    def stop(self):
+        self._is_running = False
 
 
 # ==========================================
@@ -391,9 +621,8 @@ class FileHeaderWidget(QWidget):
     def save_file(self):
         if self.side == "left":
             self.main_window.save_left_data()
-        else:
-            # Maybe save right data?
-            QMessageBox.information(self, "Info", "Saving right side not fully implemented yet (depends on source type).")
+        elif self.side == "right":
+            self.main_window.save_right_data()
 
 
 # ==========================================
@@ -416,11 +645,23 @@ class MainWindow(QMainWindow):
         
         self.doc = None # PDF Document
         
+        # 脏标记 (Session Sets)
+        self.dirty_pages_left = set()
+        self.dirty_pages_right = set()
+        self._is_updating_diff = False # Recursion Guard
+        
         # 初始化界面
         self.init_ui()
         
         # 加载数据
         self.reload_all_data()
+        
+    def closeEvent(self, event):
+        """退出前检查未保存的更改"""
+        if self.check_unsaved_changes():
+            event.accept()
+        else:
+            event.ignore()
         
     def load_config(self):
         if os.path.exists("config.json"):
@@ -475,10 +716,16 @@ class MainWindow(QMainWindow):
         
         toolbar.addSeparator()
         
-        # 保存按钮
-        btn_save = QPushButton("保存左侧")
-        btn_save.clicked.connect(self.save_left_data)
-        toolbar.addWidget(btn_save)
+        # 保存按钮 (Removing redundant generic save button as requested)
+        # btn_save = QPushButton("保存左侧")
+        # btn_save.clicked.connect(self.save_left_data)
+        # toolbar.addWidget(btn_save)
+        
+        # 批量 OCR 按钮
+        if self.config.get("ocr_api_url") and self.config.get("ocr_api_token"):
+             self.btn_batch = QPushButton("OCR所有缺失页面")
+             self.btn_batch.clicked.connect(self.run_batch_ocr)
+             toolbar.addWidget(self.btn_batch)
         
         btn_export = QPushButton("导出切图")
         btn_export.clicked.connect(self.export_slices)
@@ -548,9 +795,13 @@ class MainWindow(QMainWindow):
         right_box.addWidget(self.header_right)
         right_box.addWidget(self.edit_right)
         
+        # 初始化 Highlighters
+        self.highlighter_left = DiffSyntaxHighlighter(self.edit_left.document())
+        self.highlighter_right = DiffSyntaxHighlighter(self.edit_right.document())
+        
         # 绑定信号
-        self.edit_left.textChanged.connect(self.on_text_changed)
-        self.edit_right.textChanged.connect(self.on_text_changed)
+        self.edit_left.textChanged.connect(self.on_text_changed_left)
+        self.edit_right.textChanged.connect(self.on_text_changed_right)
         
         # 绑定 Patch 信号
         self.edit_left.apply_patch_signal.connect(lambda r, t: self.apply_patch(self.edit_left, r, t))
@@ -573,7 +824,14 @@ class MainWindow(QMainWindow):
         
         # 标记是否正在编程滚动，防止死循环
         self._is_program_scrolling = False
+        
+        # 进度条 (Added to Status Bar)
+        # 进度条 (Added to Status Bar)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.statusBar().addPermanentWidget(self.progress_bar)
 
+        # Finalize Layout
         text_splitter.addWidget(left_container)
         text_splitter.addWidget(right_container_widget)
         right_layout.addWidget(text_splitter)
@@ -601,22 +859,34 @@ class MainWindow(QMainWindow):
 
         self.load_current_page()
 
+ 
+
     def load_current_page(self):
+        # Session-based dirty tracking: No prompts here.
         page_num = self.config.get('start_page', 1)
         try:
             page_num = int(self.spin_page.text())
-        except:
-            pass
+        except: pass
         
-        # 界面同步
         self.spin_page.setText(str(page_num))
         
-        # 1. 显示图片 (如果有)
-        pix = self.get_page_pixmap(page_num)
-        
-        # 2. 准备 OCR 数据 (Always Load if valid)
+        # 1. Load OCR Data
         ocr_data = self.load_ocr_json(page_num)
-        self.current_ocr_data = ocr_data
+        self.current_ocr_data = ocr_data # Store for highlighting
+        
+        # 2. Load Image (High Res)
+        if self.doc:
+            # Check OCR status
+            ocr_state = " (OCR Done)" if ocr_data else " (No OCR)"
+            self.statusBar().showMessage(f"Page {page_num} Loaded{ocr_state}")
+            
+            img_bytes = self.get_best_page_image_bytes(self.doc, page_num)
+            if img_bytes:
+                img = QImage.fromData(img_bytes)
+                pix = QPixmap.fromImage(img)
+                self.image_view.load_content(pix, ocr_data)
+            else:
+                 self.image_view.load_content(None)
         
         # 3. 构建 OCR 映射 (如果存在)
         self.ocr_text_full = ""
@@ -674,7 +944,7 @@ class MainWindow(QMainWindow):
         else:
             right_text = self.pages_right_text.get(page_num, "")
 
-        # 避免触发 textChanged 导致死循环
+        # 避免触发 textChanged 导致死循环 (以及标记 modified)
         self.edit_left.blockSignals(True)
         self.edit_right.blockSignals(True)
         
@@ -683,6 +953,10 @@ class MainWindow(QMainWindow):
         
         self.edit_left.blockSignals(False)
         self.edit_right.blockSignals(False)
+        
+        # 重置脏标记
+        self.modified_left = False
+        self.modified_right = False
         
         # 4. 执行对比
         self.run_diff()
@@ -694,29 +968,39 @@ class MainWindow(QMainWindow):
         else:
             self.ocr_diff_opcodes = self.edit_left.diff_opcodes # 复用主 Diff (如果右侧就是OCR)
 
+    def get_best_page_image_bytes(self, doc, page_num):
+        """Extract High-Res or Raw image from PDF"""
+        try:
+             idx = page_num + self.config['page_offset'] - 1
+             if 0 < idx <= len(doc):
+                 page = doc[idx - 1]
+                 
+                 # 1. Try Extract Raw Image (scanned PDF)
+                 try:
+                     images = page.get_images()
+                     if len(images) == 1:
+                         xref = images[0][0]
+                         base_image = doc.extract_image(xref)
+                         return base_image["image"]
+                 except: pass # some implementation might fail
+                 
+                 # 2. Fallback: High DPI Render
+                 pix = page.get_pixmap(matrix=fitz.Matrix(3.0, 3.0))
+                 return pix.tobytes("png")
+        except: pass
+        return None
+
     def get_page_pixmap(self, page_num):
-        """获取图片：优先 PDF，其次图片目录"""
-        idx = page_num + self.config['page_offset'] - 1
-        
-        # PDF
-        if self.doc and 1 <= idx <= len(self.doc):
-            try:
-                page = self.doc[idx-1]
-                pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
-                # PyMuPDF pixmap -> QImage
-                img_format = QImage.Format.Format_RGB888
-                if pix.alpha: img_format = QImage.Format.Format_RGBA8888
-                
-                img = QImage(pix.samples, pix.width, pix.height, pix.stride, img_format)
+        """Helper for image cropping etc (still needed?) -> Refactor to use get_best..."""
+        if self.doc:
+            b = self.get_best_page_image_bytes(self.doc, page_num)
+            if b:
+                img = QImage.fromData(b)
                 return QPixmap.fromImage(img)
-            except Exception as e:
-                print(e)
-        
-        # Image Dir
         img_dir = self.config['image_dir']
         if img_dir and os.path.exists(img_dir):
             # 尝试 page_1.jpg 或 1.jpg
-            names = [f"page_{idx}", f"{idx}"]
+            names = [f"page_{page_num}", f"{page_num}"]
             exts = [".jpg", ".png", ".jpeg"]
             for n in names:
                 for e in exts:
@@ -728,7 +1012,6 @@ class MainWindow(QMainWindow):
     def load_ocr_json(self, page_num):
         """加载 PaddleOCR 格式 JSON"""
         path = self.config['ocr_json_path']
-        page_num += self.config['page_offset'] - 1
         f_path = os.path.join(path, f"page_{page_num}.json")
         if not os.path.exists(f_path):
             # 尝试直接数字
@@ -753,7 +1036,7 @@ class MainWindow(QMainWindow):
                             data = data["layoutParsingResults"][0]
                         blocks = data.get("prunedResult", {}).get("parsing_res_list", [])
                         for b in blocks:
-                            if b.get('block_label') in ['text','vertical_text']:
+                            if b.get('block_label') == 'text':
                                 res.append({
                                     'text': b.get('block_content'),
                                     'bbox': b.get('block_bbox')
@@ -775,80 +1058,47 @@ class MainWindow(QMainWindow):
         self.ocr_diff_opcodes = matcher.get_opcodes()
 
     def run_diff(self):
-        text_l = self.edit_left.toPlainText()
-        text_r = self.edit_right.toPlainText()
+        if self._is_updating_diff: return
+        self._is_updating_diff = True
         
-        matcher = difflib.SequenceMatcher(None, text_l, text_r, autojunk=False)
-        opcodes = matcher.get_opcodes()
-        
-        # 将 diff 数据传递给编辑器，供交互使用
-        self.edit_left.set_diff_data(opcodes, text_r)
-        self.edit_right.set_diff_data(opcodes, text_l)
-        
-        # 渲染颜色
-        self.highlight_editor(self.edit_left, opcodes, is_left=True)
-        self.highlight_editor(self.edit_right, opcodes, is_left=False)
-        
-        # 渲染词头正则
-        self.highlight_regex(self.edit_left, self.config.get("regex_left"))
-        self.highlight_regex(self.edit_right, self.config.get("regex_right"))
-        
-        # 如果不在 OCR 模式，更新 OCR Mapping
-        if self.combo_source.currentText() != "OCR Results" and self.ocr_text_full:
-            self.run_ocr_mapping_diff(text_l)
+        try:
+            text_l = self.edit_left.toPlainText()
+            text_r = self.edit_right.toPlainText()
+            
+            matcher = difflib.SequenceMatcher(None, text_l, text_r, autojunk=False)
+            opcodes = matcher.get_opcodes()
+            
+            # 将 diff 数据传递给编辑器，供交互使用
+            self.edit_left.set_diff_data(opcodes, text_r)
+            self.edit_right.set_diff_data(opcodes, text_l)
+            
+            # 渲染颜色 (使用 Highlighter)
+            # Block signals to prevent feedback loop
+            self.edit_left.blockSignals(True)
+            self.edit_right.blockSignals(True)
+            self.highlighter_left.set_diff_data(opcodes, is_left=True)
+            self.highlighter_right.set_diff_data(opcodes, is_left=False)
+            self.edit_left.blockSignals(False)
+            self.edit_right.blockSignals(False)
+            
+            # 渲染词头正则
+            self.highlighter_left.set_regex(self.config.get("regex_left"))
+            self.highlighter_right.set_regex(self.config.get("regex_right"))
+            
+            # 如果不在 OCR 模式，更新 OCR Mapping
+            if self.combo_source.currentText() != "OCR Results" and self.ocr_text_full:
+                self.run_ocr_mapping_diff(text_l)
+        finally:
+            self._is_updating_diff = False
 
 
     def highlight_editor(self, editor, opcodes, is_left):
-        editor.blockSignals(True)
-        
-        # 清除旧格式 (保留字体)
-        cursor = editor.textCursor()
-        cursor.select(QTextCursor.SelectionType.Document)
-        fmt = QTextCharFormat()
-        fmt.setForeground(QColor("black"))
-        fmt.setBackground(QColor("transparent"))
-        cursor.setCharFormat(fmt)
-        
-        # 应用 Diff 格式
-        for tag, i1, i2, j1, j2 in opcodes:
-            if tag == 'equal': continue
-            
-            # 设置颜色：delete=红, insert=红, replace=红
-            # 也可以区分颜色，这里按照要求统一标红
-            color_fmt = QTextCharFormat()
-            color_fmt.setForeground(QColor("red"))
-            color_fmt.setBackground(QColor("#FFEEEE")) # 浅红背景
-            
-            start, end = (i1, i2) if is_left else (j1, j2)
-            
-            if start == end: 
-                # 插入点，难以高亮字符，忽略视觉，但逻辑保留
-                pass
-            else:
-                cursor.setPosition(start)
-                cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
-                cursor.mergeCharFormat(color_fmt)
-                
-        editor.blockSignals(False)
+        # Deprecated: Logic moved to DiffSyntaxHighlighter
+        pass
 
     def highlight_regex(self, editor, regex_str):
-        if not regex_str: return
-        try:
-            regex = re.compile(regex_str, re.MULTILINE)
-            text = editor.toPlainText()
-            
-            fmt = QTextCharFormat()
-            fmt.setBackground(QColor("#E0F0FF")) # 浅蓝
-            
-            cursor = editor.textCursor()
-            editor.blockSignals(True)
-            for match in regex.finditer(text):
-                cursor.setPosition(match.start())
-                cursor.setPosition(match.end(), QTextCursor.MoveMode.KeepAnchor)
-                cursor.mergeCharFormat(fmt)
-            editor.blockSignals(False)
-        except:
-            pass
+        # Deprecated: Logic moved to DiffSyntaxHighlighter
+        pass
 
     # ================= 交互 =================
 
@@ -861,16 +1111,61 @@ class MainWindow(QMainWindow):
         cursor.insertText(target_text)
         # 插入后 textChanged 会触发，自动重新 diff
 
-    def on_text_changed(self):
-        # 实时保存到内存
+    def check_unsaved_changes(self):
+        """
+        检查未保存 (Exit Only). 如果有，弹窗提示。
+        """
+        if self.dirty_pages_left or self.dirty_pages_right:
+            msg = "Unsaved changes in:\n"
+            if self.dirty_pages_left: msg += "- Left Text\n"
+            if self.dirty_pages_right: msg += "- Right Text\n"
+            msg += "Do you want to save?"
+            
+            reply = QMessageBox.question(
+                self, 
+                "Unsaved Changes", 
+                msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel
+            )
+            
+            if reply == QMessageBox.StandardButton.Cancel:
+                return False
+            elif reply == QMessageBox.StandardButton.Yes:
+                if self.dirty_pages_left: self.save_left_data()
+                if self.dirty_pages_right: self.save_right_data()
+                return True
+        return True
+
+    def on_text_changed_left(self):
+        if not self._is_updating_diff:
+            try:
+                p = int(self.spin_page.text())
+                self.dirty_pages_left.add(p)
+            except: pass
+        self.deferred_run_diff()
+        
+    def on_text_changed_right(self):
+        if not self._is_updating_diff:
+            try:
+                p = int(self.spin_page.text())
+                self.dirty_pages_right.add(p)
+            except: pass
+        self.deferred_run_diff()
+
+    def deferred_run_diff(self):
+        # 每次变动都实时同步内存 (old behavior)
         try:
             page_num = int(self.spin_page.text())
+            # self.pages_left[page_num] = self.edit_left.toPlainText() # 不要直接改 Source，这违背了“未保存”逻辑
+            # 我们应该仅在 Save 时写入 self.pages_left / Write Dict。
+            # BUT: 程序的逻辑是 page_left 是 dict 缓存。如果切换页面不保存，这些改动就丢了。
+            # 原逻辑是实时写入 pages_left，但 pages_left 只是内存。save_left_data 才是写入磁盘。
+            # 这里的 Unsaved Prompt 指的是写入磁盘。
+            # 所以：我们继续保持实时更新 memory dict 以便运行 diff，但是 save_left_data 负责持久化。
             self.pages_left[page_num] = self.edit_left.toPlainText()
             if self.combo_source.currentText() == "Text File B":
-                self.pages_right_text[page_num] = self.edit_right.toPlainText()
+                 self.pages_right_text[page_num] = self.edit_right.toPlainText()
         except: pass
-        
-        # 重新运行 diff (可以加 Timer 防抖)
         self.run_diff()
 
     def on_regex_changed(self):
@@ -1050,6 +1345,7 @@ class MainWindow(QMainWindow):
     # ================= 功能 =================
 
     def prev_page(self):
+        # No check needed
         try:
             p = int(self.spin_page.text())
             self.spin_page.setText(str(p - 1))
@@ -1057,6 +1353,7 @@ class MainWindow(QMainWindow):
         except: pass
 
     def next_page(self):
+        # No check needed
         try:
             p = int(self.spin_page.text())
             self.spin_page.setText(str(p + 1))
@@ -1064,21 +1361,45 @@ class MainWindow(QMainWindow):
         except: pass
         
     def jump_page(self):
+        # No check needed
         self.load_current_page()
 
     def save_left_data(self):
-        path = self.config['text_path_left']
-        write_pages_to_file(self.pages_left, path)
-        QMessageBox.information(self, "保存", f"左侧文本已保存至 {path}")
+        path = self.config.get('text_path_left')
+        if not path:
+             # Provide Save As?
+             path, _ = QFileDialog.getSaveFileName(self, "Save Left", "", "Text (*.txt)")
+             if path: 
+                 self.config['text_path_left'] = path
+        
+        if path:
+            write_pages_to_file(self.pages_left, path)
+            self.dirty_pages_left.clear()
+            QMessageBox.information(self, "保存", f"Left data saved to {path}")
+
+    def save_right_data(self):
+        if self.combo_source.currentText() != "Text File B":
+            QMessageBox.warning(self, "Error", "Right side is not a text file.")
+            return
+
+        path = self.config.get('text_path_right')
+        if not path:
+             path, _ = QFileDialog.getSaveFileName(self, "Save Right", "", "Text (*.txt)")
+             if path: 
+                 self.config['text_path_right'] = path
+        
+        if path:
+            write_pages_to_file(self.pages_right_text, path)
+            self.dirty_pages_right.clear()
+            QMessageBox.information(self, "保存", f"Right data saved to {path}")
 
     def run_local_ocr(self):
         if not HAS_LOCAL_OCR: return
         page_num = int(self.spin_page.text())
-        
+        img_path = ""
         
         # 导出当前页面图片为临时文件供 OCR
         pix = self.get_page_pixmap(page_num)
-        
         if not pix:
             QMessageBox.warning(self, "Error", "没有图片可供 OCR")
             return
@@ -1100,7 +1421,6 @@ class MainWindow(QMainWindow):
             # 保存到 json
             save_dir = self.config['ocr_json_path']
             if not os.path.exists(save_dir): os.makedirs(save_dir)
-            page_num += self.config['page_offset'] - 1
             json_path = os.path.join(save_dir, f"page_{page_num}.json")
             
             with open(json_path, "w", encoding='utf-8') as f:
@@ -1121,85 +1441,107 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "OCR Error", str(e))
 
     def run_remote_ocr(self):
-        """运行远程 OCR"""
+        """运行单页远程 OCR (Async)"""
         api_url = self.config.get("ocr_api_url")
         token = self.config.get("ocr_api_token")
-        
         if not api_url or not token:
-            QMessageBox.warning(self, "Config Error", "Please configure ocr_api_url and ocr_api_token in config.json")
+            QMessageBox.warning(self, "Config", "Missing URL/Token")
             return
 
-        page_num = self.spin_page.text()
         try:
-            page_num = int(page_num)
+            page_num = int(self.spin_page.text())
         except: return
+        
+        # Disable button?
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self.start_ocr_thread('single', [page_num])
 
-        # 1. Get Image
-        pix = self.get_page_pixmap(page_num)
-        if not pix:
-            QMessageBox.warning(self, "Error", "No image found for this page.")
+    def run_batch_ocr(self):
+        """批量 OCR / Cancel"""
+        # Toggle Logic: Cancel
+        if hasattr(self, 'ocr_thread') and self.ocr_thread and self.ocr_thread.isRunning():
+            self.ocr_thread.stop()
+            self.btn_batch.setText("Stopping...")
+            self.btn_batch.setEnabled(False)
+            return
+
+        # Start Logic
+        api_url = self.config.get("ocr_api_url")
+        token = self.config.get("ocr_api_token")
+        if not api_url or not token:
+            QMessageBox.warning(self, "Config", "Missing URL/Token")
             return
             
-        # 2. Save to buffer/base64
-        # We can use QBuffer, but saving to temp file is easier to reuse logic or debug
-        temp_img = "temp_remote_ocr.jpg"
-        pix.save(temp_img)
+        start = self.config.get("start_page", 1)
+        end = self.config.get("end_page", 100)
         
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        self.statusBar().showMessage(f"Running Remote OCR for page {page_num}...")
+        missing_pages = []
+        save_dir = self.config.get("ocr_json_path", "ocr_results")
         
-        try:
-            # 3. Request
-            with open(temp_img, "rb") as file:
-                file_bytes = file.read()
-                file_data = base64.b64encode(file_bytes).decode("ascii")
-
-            headers = {
-                "Authorization": f"token {token}",
-                "Content-Type": "application/json"
-            }
-
-            payload = {
-                "file": file_data,
-                "fileType": 1,
-                "useDocOrientationClassify": False,
-                "useDocUnwarping": False,
-                "useChartRecognition": False,
-            }
-
-            response = requests.post(api_url, json=payload, headers=headers)
-            
-            if response.status_code != 200:
-                raise Exception(f"Remote Error: {response.text}")
+        for p in range(start, end + 1):
+            if not os.path.exists(os.path.join(save_dir, f"page_{p}.json")):
+                missing_pages.append(p)
                 
-            result = response.json().get("result")
+        if not missing_pages:
+            QMessageBox.information(self, "Info", "No missing OCR pages found.")
+            return
             
-            # 4. Save result
-            save_dir = self.config['ocr_json_path']
-            if not os.path.exists(save_dir) and save_dir: 
-                try: os.makedirs(save_dir)
-                except: pass
-                
-            if not save_dir:
-                save_dir = "ocr_results" # default fallback
-                if not os.path.exists(save_dir): os.makedirs(save_dir)
-            page_num += self.config['page_offset'] - 1
-            json_path = os.path.join(save_dir, f"page_{page_num}.json")
-            with open(json_path, "w", encoding='utf8') as json_file:
-                json.dump(result, json_file, ensure_ascii=False, indent=2)
-                
-            QApplication.restoreOverrideCursor()
-            self.statusBar().showMessage("Remote OCR Done.")
-            QMessageBox.information(self, "Success", f"Remote OCR saved to {json_path}")
-            
-            # 5. Reload
-            self.combo_source.setCurrentText("OCR Results")
-            self.load_current_page()
-            
-        except Exception as e:
-            QApplication.restoreOverrideCursor()
-            print(e)
-            QMessageBox.critical(self, "Remote OCR Error", str(e))
+        # ret = QMessageBox.question(self, "Batch OCR", f"Found {len(missing_pages)} missing pages. Start?", 
+        #                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        # if ret == QMessageBox.StandardButton.Yes:
+        
+        # Direct Start with Cancel Option
+        self.btn_batch.setText("Cancel OCR")
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, len(missing_pages))
+        self.progress_bar.setValue(0)
+        
+        self.start_ocr_thread('batch', missing_pages)
+
+    def start_ocr_thread(self, mode, pages):
+        self.ocr_thread = OCRWorker(mode, pages, self.config, self.doc) # Pass raw doc? no, pass path or handle in main
+        # Passing self.doc to thread is risky if main thread accesses it. 
+        # But OCRWorker only reads. However, fitz doc might be not thread safe.
+        # Better: OCRWorker opens its own doc (via path).
+        # We need to pass pdf_path.
+        
+        # Wait, get_best_page_image_bytes needs doc. 
+        # If we pass doc, we must ensure main thread doesn't use it or lock it.
+        # Safest: Let Worker open file.
+        
+        self.ocr_thread = OCRWorker(mode, pages, self.config, self.config.get('pdf_path'))
+        self.ocr_thread.progress.connect(self.on_ocr_progress)
+        self.ocr_thread.finished.connect(self.on_ocr_finished)
+        self.ocr_thread.start()
+
+    def on_ocr_progress(self, msg):
+        self.statusBar().showMessage(msg)
+        if hasattr(self, 'ocr_thread') and self.ocr_thread.mode == 'batch':
+             val = self.progress_bar.value()
+             self.progress_bar.setValue(val + 1)
+
+    def on_ocr_finished(self, success, msg):
+        QApplication.restoreOverrideCursor()
+        self.statusBar().showMessage(msg, 5000)
+        
+        # Reset Batch UI
+        if hasattr(self, 'btn_batch'):
+            self.btn_batch.setText("OCR所有缺失页面")
+            self.btn_batch.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        
+        if success:
+            if self.ocr_thread.mode == 'single':
+                # Reload current page
+                self.combo_source.setCurrentText("OCR Results")
+                self.load_current_page()
+            else:
+                QMessageBox.information(self, "Batch Done", msg)
+        else:
+            if "Program interrupted" not in msg: # Don't error on manual stop
+                 QMessageBox.critical(self, "OCR Failed", msg)
+        
+        self.ocr_thread = None
 
     def export_slices(self):
         """如果当前是 OCR 模式且有 BBox 数据，则切割"""

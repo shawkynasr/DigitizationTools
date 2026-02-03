@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QDialog, QFormLayout, QTabWidget, QListWidget, QDialogButtonBox, QInputDialog,
                              QSpinBox, QMenu)
 from PyQt6.QtGui import (QAction, QColor, QFont, QImage, QPixmap, QPen, QTextCursor, 
-                         QTextCharFormat, QCursor, QTextFormat, QSyntaxHighlighter)
+                         QTextCharFormat, QCursor, QTextFormat, QSyntaxHighlighter, QPainter)
 from PyQt6.QtWidgets import QProgressBar
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QEvent, QThread, pyqtSlot
 import bisect
@@ -800,10 +800,544 @@ class DiffWorker(QThread):
         self.result_ready.emit(opcodes, ocr_opcodes)
 
 # ==========================================
-# 4. 导出逻辑 (Generic Parser)
+# 4. Smart Image Export Helpers
+# ==========================================
+
+class TextToBBoxMapper:
+    def __init__(self, ocr_json_dir, page_offset):
+        self.ocr_json_dir = ocr_json_dir
+        self.page_offset = page_offset
+        self.cache = {} # page_num -> list of {text, bbox, label}
+
+    def load_page_data(self, page_num):
+        if page_num in self.cache: return self.cache[page_num]
+        
+        real_page_num = page_num + self.page_offset
+        candidates = [f"page_{real_page_num}.json", f"{real_page_num}.json"]
+        data = []
+        
+        f_path = None
+        for n in candidates:
+             p = os.path.join(self.ocr_json_dir, n)
+             if os.path.exists(p):
+                 f_path = p
+                 break
+        
+        if f_path:
+            try:
+                with open(f_path, 'r', encoding='utf-8') as f:
+                    raw = json.load(f)
+                    
+                # Normalize
+                if isinstance(raw, list):
+                    # Standard Paddle: [[pts, (text, conf)], ...]
+                    for item in raw:
+                         if len(item) == 2:
+                             pts = item[0]
+                             xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+                             bbox = [min(xs), min(ys), max(xs), max(ys)]
+                             txt = item[1][0]
+                             data.append({"text": txt, "bbox": bbox, "block_label": "text"})
+                elif isinstance(raw, dict):
+                     # Layout Parser
+                     blocks = []
+                     if "fullContent" in raw:
+                         blocks = raw.get("fullContent", {}).get("prunedResult", {}).get("parsing_res_list", [])
+                     
+                     if not blocks and "layoutParsingResults" in raw:
+                         # Fallback
+                         blocks = raw.get("layoutParsingResults", [{}])[0].get("prunedResult", {}).get("parsing_res_list", [])
+                     
+                     for b in blocks:
+                         if b.get('block_label') in ['text','paragraph_title','vertical_text']:
+                             data.append({
+                                 "text": b.get('block_content'),
+                                 "bbox": b.get('block_bbox'),
+                                 "block_label": b.get('block_label')
+                             })
+            except: pass
+            
+        self.cache[page_num] = data
+        return data
+
+
+    def get_page_text_map(self, page_num):
+        """
+        Returns:
+            blocks: List of block dicts
+            full_text: Concatenated string of all blocks
+            char_map: List where char_map[i] = block_index for full_text[i]
+        """
+        blocks = self.load_page_data(page_num)
+        full_text = ""
+        char_map = []
+        
+        for i, b in enumerate(blocks):
+            txt = b['text']
+            # We treat blocks as simply concatenated.
+            # Alignments will skip jumps between blocks naturally.
+            full_text += txt
+            char_map.extend([i] * len(txt))
+            
+        return blocks, full_text, char_map
+
+    def find_bboxes(self, entry_text, page_nums):
+        """
+        Map entry text to bboxes using diff alignment.
+        """
+        result_boxes = [] 
+        matched_block_indices = set() # (page, block_idx)
+        
+        # Pre-cleaning Entry Text?
+        # If we clean spaces, we lose map accuracy if we don't map back.
+        # But OCR usually lacks formatting spaces.
+        # Strategy: Match raw-ish texts.
+        
+        # Remove massive whitespace from entry to improve match quality with raw OCR
+        # But keep mapped relationships? 
+        # Actually SequenceMatcher with autojunk=True (or False) handles it.
+        # Let's use the entry_text as source query.
+        
+        clean_entry = entry_text.strip()
+        if not clean_entry: return []
+        
+        for page_num in page_nums:
+            blocks, page_text, char_map = self.get_page_text_map(page_num)
+            if not page_text: continue
+            
+            matcher = difflib.SequenceMatcher(None, clean_entry, page_text, autojunk=False)
+            
+            for i, j, n in matcher.get_matching_blocks():
+                if n == 0: continue
+                # Filter noise: single character matches that are common?
+                # e.g. matching a single punctuation.
+                if n < 2:
+                     # Check if it's CJK? CJK single char is significant.
+                     # ASCII single char is noise.
+                     chunk = clean_entry[i:i+n]
+                     if len(chunk.encode('utf-8')) == len(chunk): # Likely ASCII
+                         continue
+                
+                # Identify touched blocks
+                # Range in page_text: [j, j+n]
+                # Map to block indices
+                
+                # Boundary check
+                # char_map length might be less than j+n? No, indices are valid.
+                
+                affected = char_map[j : j+n]
+                for block_idx in affected:
+                    key = (page_num, block_idx)
+                    if key not in matched_block_indices:
+                        matched_block_indices.add(key)
+                        b = blocks[block_idx]
+                        result_boxes.append({
+                            "bbox": b['bbox'],
+                            "page": page_num,
+                            "label": b.get('block_label', 'text'),
+                            # Store index for sorting?
+                            "sort_key": (page_num, block_idx) # OCR order usually top-down/right-left
+                        })
+                        
+        # Sort results?
+        # Usually we want reading order.
+        # The page_nums iteration gives page order.
+        # Inside page, block_idx usually follows OCR reading order.
+        result_boxes.sort(key=lambda x: x["sort_key"])
+        
+        return result_boxes
+
+class BBoxMerger:
+    def merge(self, boxes):
+        """
+        Merge bboxes based on V/H rules.
+        boxes: list of {bbox: [x,y,w,h], page: int, label: str}
+        """
+        if not boxes: return []
+        
+        # Separate by page first?
+        # A Headword might span pages. Merging across pages is impossible for stitching (different source images).
+        # We will stitch per page (or just collect all merged boxes with page info).
+        
+        # Group by page
+        by_page = {}
+        for b in boxes:
+            p = b['page']
+            if p not in by_page: by_page[p] = []
+            by_page[p].append(b)
+            
+        final_merged = []
+        
+        for p in sorted(by_page.keys()):
+            page_boxes = by_page[p]
+            if not page_boxes: continue
+            
+            # Use label of first box to decide V/H ?
+            is_vertical = any(b['label'] == 'vertical_text' for b in page_boxes)
+            
+            if is_vertical:
+                merged = self._merge_vertical(page_boxes)
+            else:
+                merged = self._merge_horizontal(page_boxes)
+            final_merged.extend(merged)
+            
+        return final_merged
+
+    def _merge_horizontal(self, boxes):
+        # Sort Top-Down (y), then Left-Right (x)
+        # BBox format assumed [x, y, w, h] from loader (or list) -> Wait, layout loader uses [x,y,w,h]?
+        # Check load_ocr_json: "bbox": b.get('block_bbox') -> Usually [x,y,w,h] for layout parser?
+        # Need to be sure. My loader above: Paddle [x1,y1,x2,y2] -> converted to [x,min_y,w,h].
+        # Layout parser 'block_bbox'? Usually [x_min, y_min, w, h] or [x,y,r,b]? 
+        # CAUTION: If it's [x, y, w, h], fine. User code assumes it.
+        
+        # Let's standardize to x,y,w,h internally in Mapper loop?
+        # In Mapper: `bbox = [min(xs), min(ys), max(xs), max(ys)]` -> This is x1,y1,x2,y2.
+        # But `w = max-min`. 
+        # Wait, my TextToBBoxMapper code above:
+        # `bbox = [min(xs), min(ys), max(xs), max(ys)]` -> This is actually [x1, y1, x2, y2]. 
+        # Rect is (x1, y1, x2-x1, y2-y1).
+        
+        # Fix Mapper output to be x,y,w,h
+        pass # Will fix in next method override or ensure logic handles xyxy
+        
+        # Assume boxes have x,y,w,h (processed) or we handle it here.
+        # Let's normalize inside Merge.
+        
+        clean_boxes = []
+        for b in boxes:
+            bx = b['bbox']
+            # If length 4. Is it xywh or xyxy?
+            # Paddle loader above made it [min_x, min_y, max_x, max_y].
+            # Rect Logic: x=bx[0], y=bx[1], w=bx[2]-bx[0], h=bx[3]-bx[1].
+            x, y, x2, y2 = bx[0], bx[1], bx[2], bx[3] # Assuming xyxy from mapper
+            clean_boxes.append({'x':x, 'y':y, 'w':x2-x, 'h':y2-y, 'r':x2, 'b':y2, 'page':b['page']})
+            
+        # Sort Y
+        clean_boxes.sort(key=lambda b: (b['y'], b['x']))
+        
+        merged = []
+        if not clean_boxes: return []
+        
+        curr = clean_boxes[0]
+        
+        for i in range(1, len(clean_boxes)):
+            nex = clean_boxes[i]
+            
+            # Horizontal Merge Rule:
+            # Same column (left aligned approx)
+            # Vertical gap small
+            
+            x_diff = abs(curr['x'] - nex['x'])
+            y_gap = nex['y'] - curr['b']
+            
+            if x_diff < 50 and y_gap < 50: # Thresholds?
+                # Merge
+                new_x = min(curr['x'], nex['x'])
+                new_y = min(curr['y'], nex['y'])
+                new_r = max(curr['r'], nex['r'])
+                new_b = max(curr['b'], nex['b'])
+                curr = {'x':new_x, 'y':new_y, 'w':new_r-new_x, 'h':new_b-new_y, 'r':new_r, 'b':new_b, 'page':curr['page']}
+            else:
+                merged.append(curr)
+                curr = nex
+        merged.append(curr)
+        return merged
+
+    def _merge_vertical(self, boxes):
+        # Sort Right-to-Left (x desc), then Top-Bottom
+        
+        clean_boxes = []
+        for b in boxes:
+            bx = b['bbox']
+            x, y, x2, y2 = bx[0], bx[1], bx[2], bx[3]
+            clean_boxes.append({'x':x, 'y':y, 'w':x2-x, 'h':y2-y, 'r':x2, 'b':y2, 'page':b['page']})
+            
+        clean_boxes.sort(key=lambda b: (-b['x'], b['y']))
+        
+        merged = []
+        if not clean_boxes: return []
+        
+        curr = clean_boxes[0]
+        
+        for i in range(1, len(clean_boxes)):
+            nex = clean_boxes[i]
+            
+            # Vertical Merge Rule:
+            # User: "Front Box Left" and "Back Box Right" close -> Same column?
+            # i.e. `curr.x` (left edge) approx `nex.r` (right edge)? No, that's wrapping.
+            # Vertical text columns are adjacent horizontally.
+            # If they are in the SAME column, they share X range?
+            # But usually Vertical Text is strictly column based.
+            
+            # Rule: If X-range overlaps significantly?
+            # Or User Rule: "Right to Left merge".
+            # The input said: "前一个矩形框左侧和后一个矩形框右侧差别不大... 在同一栏".
+            # "Prev Left" approx "Next Right"?
+            # If Prev is strictly to the RIGHT of Next (R-L order), then Prev.Left > Next.Right.
+            # If "Diff small": Gap is small.
+            
+            gap = curr['x'] - nex['r'] # Gap between Prev Left and Next Right
+            
+            # Vertical overlap?
+            y_overlap = max(0, min(curr['b'], nex['b']) - max(curr['y'], nex['y']))
+            
+            # Merge if adjacent columns? Wait. "Merge into one image... width is sum".
+            # If we merge, we create a Super BBox that spans both columns?
+            # OR do we merge fragmented boxes within a column?
+            # User requirement: "Export slicing... merge pictures... width is sum".
+            # This implies the Stitcher does the visual merge. BBoxMerger just groupings?
+            # "合并矩形框... 完成后一个词条仍然对应多个矩形框".
+            # So BBoxMerger is reducing fragmentation.
+            
+            # Interpretation:
+            # - Horizontal: Multiline text in one column -> Merge into one big box (for that column).
+            # - Vertical: Multi-column text -> Merge?
+            # User says: "If same column -> merge".
+            # And "One entry corresponds to multiple bboxes" (after merge).
+            # So we DON'T merge across columns (usually).
+            
+            # Check if same column for Vertical Text:
+            # Similar X range.
+            x_center_1 = curr['x'] + curr['w']/2
+            x_center_2 = nex['x'] + nex['w']/2
+            
+            if abs(x_center_1 - x_center_2) < 20: # Same column
+                 # Merge vertically (extend height)
+                 new_y = min(curr['y'], nex['y'])
+                 new_b = max(curr['b'], nex['b'])
+                 new_x = min(curr['x'], nex['x'])
+                 new_r = max(curr['r'], nex['r'])
+                 
+                 curr = {'x':new_x, 'y':new_y, 'w':new_r-new_x, 'h':new_b-new_y, 'r':new_r, 'b':new_b, 'page':curr['page']}
+            else:
+                 merged.append(curr)
+                 curr = nex
+                 
+        merged.append(curr)
+        return merged
+
+class ImageStitcher:
+    def stitch(self, boxes, doc, img_dir, page_offset, is_vertical_text):
+        """
+        Crop and stitch.
+        boxes: list of merged {x,y,w,h,page}
+        doc: PDF doc (High Res)
+        img_dir: Image Dir fallback
+        """
+        slices = []
+        for b in boxes:
+            # Get Image
+            page_num = b['page']
+            real_p = page_num + page_offset
+            
+            img_qt = None
+            
+            try:
+                if doc:
+                    if 0 < real_p <= len(doc):
+                        page = doc[real_p-1]
+                        # Crop rect
+                        rect = fitz.Rect(b['x'], b['y'], b['r'], b['b'])
+                        # High DPI
+                        pix = page.get_pixmap(matrix=fitz.Matrix(3,3), clip=rect)
+                        img_qt = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
+                
+                # Fallback to local file if PDF failed or missing
+                if not img_qt and img_dir:
+                    candidates = [f"page_{real_p}", f"{real_p}"]
+                    exts = [".jpg", ".jpeg", ".png", ".bmp"]
+                    
+                    found_path = None
+                    for c in candidates:
+                        for ext in exts:
+                             p = os.path.join(img_dir, c + ext)
+                             if os.path.exists(p):
+                                 found_path = p
+                                 break
+                        if found_path: break
+                        
+                    if found_path:
+                         full_img = QImage(found_path)
+                         if not full_img.isNull():
+                             # Crop
+                             # Coordinates (x,y,w,h) in OCR JSON usually match pixel coordinates of the source image.
+                             # Check bounds
+                             x, y, w, h = int(b['x']), int(b['y']), int(b['w']), int(b['h'])
+                             img_qt = full_img.copy(x, y, w, h)
+                             
+            except Exception as e:
+                print(f"Stitch crop error: {e}")
+                pass
+            
+            if img_qt and not img_qt.isNull():
+                slices.append(img_qt)
+            
+        if not slices: return None
+        
+        padding = 10
+        
+        if is_vertical_text:
+            # Stitch Right-to-Left (Horizontal Stack)
+            # Canvas
+            max_h = max(s.height() for s in slices)
+            total_w = sum(s.width() for s in slices) + padding * (len(slices)-1)
+            
+            final_img = QImage(total_w + 20, max_h + 20, QImage.Format.Format_RGB888)
+            final_img.fill(QColor("white"))
+            
+            painter = QPainter(final_img)
+            # Enable smooth pixmap transform? 
+            # painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            
+            current_x = final_img.width() - 10 # Start from Right
+            
+            for s in slices:
+                x = current_x - s.width()
+                y = 10 # Top padding
+                painter.drawImage(x, y, s)
+                current_x = x - padding
+            painter.end()
+            
+        else:
+            # Stitch Top-to-Bottom (Vertical Stack)
+            max_w = max(s.width() for s in slices)
+            total_h = sum(s.height() for s in slices) + padding * (len(slices)-1)
+            
+            final_img = QImage(max_w + 20, total_h + 20, QImage.Format.Format_RGB888)
+            final_img.fill(QColor("white"))
+            
+            painter = QPainter(final_img)
+            
+            current_y = 10
+            
+            for s in slices:
+                x = 10 
+                painter.drawImage(x, current_y, s)
+                current_y += s.height() + padding
+            painter.end()
+            
+        return final_img
+
+
+class ImageExportWorker(QThread):
+    progress = pyqtSignal(str) # Message
+    finished = pyqtSignal(bool, str) # Success, Msg
+
+    def __init__(self, entries, project_config, fmt, export_dir, side):
+        super().__init__()
+        self.entries = entries
+        self.project_config = project_config
+        self.fmt = fmt # 'json' or 'mdx'
+        self.export_dir = export_dir
+        self.side = side # 'left' or 'right'
+        
+        self.is_running = True
+        
+        # Helpers
+        self.mapper = TextToBBoxMapper(project_config.get('ocr_json_path', 'ocr_results'), project_config.get('page_offset', 0))
+        self.merger = BBoxMerger()
+        self.stitcher = ImageStitcher()
+
+    def run(self):
+        try:
+            self.progress.emit("Initializing export...")
+            
+            # Prepare Image Dir
+            out_img_dir = os.path.join(self.export_dir, "output_images")
+            if not os.path.exists(out_img_dir):
+                os.makedirs(out_img_dir)
+                
+            # Load PDF
+            doc = None
+            pdf_path = self.project_config.get('pdf_path', '')
+            if pdf_path and os.path.exists(pdf_path):
+                try: doc = fitz.open(pdf_path)
+                except: pass
+                
+            total = len(self.entries)
+            
+            for i, entry in enumerate(self.entries):
+                if not self.is_running: break
+                
+                headword = entry['headword']
+                # Limit filename length/chars
+                safe_hw = re.sub(r'[\\/*?:"<>|]', '_', headword)
+                safe_hw = safe_hw.strip()[:50]
+                
+                self.progress.emit(f"Processing ({i+1}/{total}): {headword}...")
+                
+                # 1. Map
+                bboxes = self.mapper.find_bboxes(entry['text'], entry['pages'])
+                
+                if bboxes:
+                    # 2. Merge
+                    merged = self.merger.merge(bboxes)
+                    
+                    # 3. Stitch
+                    # Determine orientation from first box label?
+                    is_vertical = any(b['label'] == 'vertical_text' for b in bboxes)
+                    
+                    stitched_img = self.stitcher.stitch(merged, doc, self.project_config.get('image_dir'), 
+                                                        self.project_config.get('page_offset', 0), is_vertical)
+                    
+                    if stitched_img:
+                        # 4. Save
+                        # Format: {page_num}_{page_index}.jpg
+                        # Use first page of entry?
+                        page_num = entry['pages'][0] if entry['pages'] else 0
+                        page_idx = entry.get('page_index', 0)
+                        
+                        img_filename = f"{page_num}_{page_idx}.jpg"
+                        # Handle duplicate? (If multiple entries have same page/idx? Unlikely if logic correct)
+                        # But just in case
+                        save_path = os.path.join(out_img_dir, img_filename)
+                        stitched_img.save(save_path)
+                        
+                        # 5. Link
+                        # Relative path for JSON/MDX?
+                        # JSON: "output_images/filename.jpg"
+                        # MDX: <img src="output_images/filename.jpg" />
+                        
+                        rel_path = f"output_images/{img_filename}"
+                        entry['image_path'] = rel_path
+                        
+                # Update progress
+                
+            # Save Final Text File
+            self.progress.emit("Saving index file...")
+            
+            project_name = self.project_config.get("name", "project")
+            base_name = f"{project_name}_{self.side}.{self.fmt if self.fmt=='json' else 'txt'}"
+            final_path = os.path.join(self.export_dir, base_name)
+            
+            with open(final_path, 'w', encoding='utf-8') as f:
+                if self.fmt == 'json':
+                    json.dump(self.entries, f, ensure_ascii=False, indent=2)
+                elif self.fmt == 'mdx':
+                    for e in self.entries:
+                        f.write(f"{e['headword']}\n")
+                        f.write(f"{e['text']}\n")
+                        if 'image_path' in e:
+                            # MDX generic image tag
+                            f.write(f'<img src="{e["image_path"]}" />\n')
+                        f.write("</>\n")
+            
+            self.finished.emit(True, f"Export success! Saved to {final_path}")
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.finished.emit(False, str(e))
+        finally:
+            if doc: doc.close()
+
+# ==========================================
+# 5. Export Logic (Generic Parser)
 # ==========================================
 
 class ExportParser:
+
     def __init__(self, pages_dict: dict, regex_str: str, group_id: int = 0):
         self.pages_dict = pages_dict # {page_num: text}
         self.group_id = group_id
@@ -1440,6 +1974,11 @@ class MainWindow(QMainWindow):
         add_action("Export RIGHT Text (.json)", lambda: self.export_parsed("right", "json"))
         add_action("Export LEFT Text (.mdx.txt)", lambda: self.export_parsed("left", "mdx"))
         add_action("Export RIGHT Text (.mdx.txt)", lambda: self.export_parsed("right", "mdx"))
+        self.menu_export.addSeparator()
+        add_action("Export LEFT JSON + Images", lambda: self.export_parsed_with_images("left", "json"))
+        add_action("Export RIGHT JSON + Images", lambda: self.export_parsed_with_images("right", "json"))
+        add_action("Export LEFT MDX + Images", lambda: self.export_parsed_with_images("left", "mdx"))
+        add_action("Export RIGHT MDX + Images", lambda: self.export_parsed_with_images("right", "mdx"))
         
         self.btn_export_menu.setMenu(self.menu_export)
         toolbar.addWidget(self.btn_export_menu)
@@ -1771,6 +2310,7 @@ class MainWindow(QMainWindow):
                         for b in blocks:
                             if b.get('block_label') in ['text','paragraph_title','vertical_text']:
                                 res.append({
+                                    'block_label': b.get('block_label'),
                                     'text': b.get('block_content'),
                                     'bbox': b.get('block_bbox')
                                 })
@@ -2408,6 +2948,64 @@ class MainWindow(QMainWindow):
             import traceback
             traceback.print_exc()
             QMessageBox.critical(self, "Error", str(e))
+
+    def export_parsed_with_images(self, side, fmt):
+        """Export parsed content AND generate stitched images"""
+        
+        # 1. Output Dir Check
+        export_dir = self.project_config.get("export_dir")
+        if not export_dir or not os.path.exists(export_dir):
+            export_dir = QFileDialog.getExistingDirectory(self, "Select Export Directory")
+            if not export_dir: return
+        
+        # 2. Get Data
+        pages = self.pages_left if side == 'left' else self.pages_right_text
+        if not pages:
+            QMessageBox.warning(self, "Error", f"No data for {side} side.")
+            return
+
+        reg = self.project_config.get("regex_left" if side == 'left' else "regex_right")
+        if not reg:
+            QMessageBox.warning(self, "Error", f"No regex configured for {side} side.")
+            return
+            
+        grp = self.project_config.get("regex_group_left" if side == 'left' else "regex_group_right", 0)
+
+        # 3. Parse entries first (Synchronous, fast enough usually)
+        try:
+            parser = ExportParser(pages, reg, grp)
+            entries = parser.parse()
+            if not entries:
+                QMessageBox.warning(self, "Result", "No entries found.")
+                return
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Parse failed: {e}")
+            return
+
+        # 4. Start Background Worker
+        self.img_export_worker = ImageExportWorker(entries, self.project_config, fmt, export_dir, side)
+        
+        # Progress Dialog
+        from PyQt6.QtWidgets import QProgressDialog
+        self.progress_dlg = QProgressDialog("Exporting Images...", "Cancel", 0, 0, self)
+        self.progress_dlg.setWindowTitle("Exporting")
+        self.progress_dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        self.progress_dlg.setMinimumDuration(0)
+        self.progress_dlg.show()
+        
+        self.img_export_worker.progress.connect(self.progress_dlg.setLabelText)
+        self.img_export_worker.finished.connect(self.on_img_export_finished)
+        self.progress_dlg.canceled.connect(self.img_export_worker.terminate) # Or stop flag
+        
+        self.img_export_worker.start()
+
+    def on_img_export_finished(self, success, msg):
+        self.progress_dlg.close()
+        if success:
+            QMessageBox.information(self, "Export Success", msg)
+        else:
+            QMessageBox.critical(self, "Export Failed", msg)
+        self.img_export_worker = None
 
     def _confirm_overwrite_if_exists(self, filename):
         if os.path.exists(filename):

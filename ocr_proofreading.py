@@ -9,13 +9,13 @@ import base64
 import time
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QSplitter, QTextEdit, QLabel, QToolBar, QFileDialog, 
-                             QMessageBox, QLineEdit, QPushButton, QComboBox, QCheckBox,
-                             QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsRectItem,
-                             QDialog, QFormLayout, QTabWidget, QListWidget, QDialogButtonBox, QInputDialog,
-                             QSpinBox, QMenu)
-from PyQt6.QtGui import (QAction, QColor, QFont, QImage, QPixmap, QPen, QTextCursor, 
-                         QTextCharFormat, QCursor, QTextFormat, QSyntaxHighlighter, QPainter)
+                             QTextEdit, QLabel, QPushButton, QSplitter, QFileDialog, 
+                             QMessageBox, QListWidget, QGraphicsView, QGraphicsScene, 
+                             QGraphicsRectItem, QGraphicsPixmapItem, QLineEdit, 
+                             QFormLayout, QDialog, QDialogButtonBox, QSpinBox, 
+                             QTabWidget, QToolBar, QComboBox, QCheckBox, QMenu)
+from PyQt6.QtGui import (QTextCursor, QColor, QSyntaxHighlighter, QTextCharFormat, 
+                         QAction, QPixmap, QImage, QPainter, QBrush, QPen, QFont, QImageReader)
 from PyQt6.QtWidgets import QProgressBar
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QEvent, QThread, pyqtSlot
 import bisect
@@ -38,6 +38,59 @@ def to_py_pos(full_text: str, qt_pos: int) -> int:
             return i
         curr_qt += 2 if ord(c) > 0xFFFF else 1
     return len(full_text)
+
+
+def get_page_image(doc, img_dir, real_page_num):
+    """
+    Helper: Extract image bytes from PDF or local directory.
+    Priority:
+    1. PDF Embedded Image (if single)
+    2. PDF Render (High DPI)
+    3. Local File (page_X.jpg/png)
+    """
+    img_bytes = None
+    
+    # 1. Try PDF
+    if doc:
+        try:
+            if 0 < real_page_num <= len(doc):
+                page = doc[real_page_num-1]
+                
+                # Try Raw Extraction (Preferred for embedded images)
+                images = page.get_images()
+                if len(images) == 1:
+                    xref = images[0][0]
+                    base_image = doc.extract_image(xref)
+                    img_bytes = base_image["image"]
+                else:
+                    # Fallback High DPI Render
+                    pix = page.get_pixmap(matrix=fitz.Matrix(3.0, 3.0))
+                    img_bytes = pix.tobytes("png")
+        except Exception as e:
+            # print(f"PDF extract error: {e}")
+            pass
+            
+    # 2. Try Local File
+    if not img_bytes and img_dir:
+        candidates = [f"page_{real_page_num}", f"{real_page_num}"]
+        exts = [".jpg", ".jpeg", ".png", ".bmp"]
+        found_path = None
+        for c in candidates:
+            for ext in exts:
+                 p = os.path.join(img_dir, c + ext)
+                 if os.path.exists(p):
+                     found_path = p
+                     break
+            if found_path: break
+            
+        if found_path:
+             try:
+                 with open(found_path, "rb") as f:
+                     img_bytes = f.read()
+             except: pass
+             
+    return img_bytes
+
 
 # ==========================================
 # 0. 全局工具与配置管理
@@ -665,40 +718,10 @@ class OCRWorker(QThread):
             try:
                 self.progress.emit(f"Processing page {page_num} ({i+1}/{total})...")
                 real_page_num = page_num + self.project_config.get("page_offset", 0)
-                # 1. Get Image Data (Bytes)
-                img_bytes = None
                 
-                if doc:
-                    try:
-                        
-                        if 0 < real_page_num <= len(doc):
-                            page = doc[real_page_num-1]
-                            
-                            # Try Raw
-                            images = page.get_images()
-                            if len(images) == 1:
-                                xref = images[0][0]
-                                base_image = doc.extract_image(xref)
-                                img_bytes = base_image["image"]
-                            else:
-                                # Fallback High DPI
-                                pix = page.get_pixmap(matrix=fitz.Matrix(3.0, 3.0))
-                                img_bytes = pix.tobytes("png")
-                    except: pass
-                    
-                if not img_bytes:
-                    img_dir = self.project_config.get('image_dir')
-                    if img_dir:
-                        names = [f"page_{real_page_num}", f"{real_page_num}"]
-                        exts = [".jpg", ".png", ".jpeg"]
-                        for n in names:
-                            for e in exts:
-                                p = os.path.join(img_dir, n + e)
-                                if os.path.exists(p):
-                                    with open(p, "rb") as f:
-                                        img_bytes = f.read()
-                                    break
-                            if img_bytes: break
+                # 1. Get Image Data (Bytes) using helper
+                img_dir = self.project_config.get('image_dir')
+                img_bytes = get_page_image(doc, img_dir, real_page_num)
                             
                 if not img_bytes:
                     if self.mode == 'single':
@@ -1118,6 +1141,30 @@ class BBoxMerger:
         return merged
 
 class ImageStitcher:
+    def predict_size(self, boxes, is_vertical_text):
+        """
+        Predict stitched image size without processing.
+        Returns (width, height)
+        """
+        if not boxes: return 0, 0
+        
+        padding = 10
+        if is_vertical_text:
+            # Right-to-Left (Horizontal Stack)
+            # Width = Sum of widths + padding
+            # Height = Max height
+            # Note: The QImage in stitch adds +20 (canvas padding)
+            max_h = max(b['h'] for b in boxes)
+            total_w = sum(b['w'] for b in boxes) + padding * (len(boxes)-1)
+            return int(total_w + 20), int(max_h + 20)
+        else:
+            # Top-to-Bottom (Vertical Stack)
+            # Width = Max width
+            # Height = Sum of heights + padding
+            max_w = max(b['w'] for b in boxes)
+            total_h = sum(b['h'] for b in boxes) + padding * (len(boxes)-1)
+            return int(max_w + 20), int(total_h + 20)
+
     def stitch(self, boxes, doc, img_dir, page_offset, is_vertical_text):
         """
         Crop and stitch.
@@ -1134,38 +1181,19 @@ class ImageStitcher:
             img_qt = None
             
             try:
-                if doc:
-                    if 0 < real_p <= len(doc):
-                        page = doc[real_p-1]
-                        # Crop rect
-                        rect = fitz.Rect(b['x'], b['y'], b['r'], b['b'])
-                        # High DPI
-                        pix = page.get_pixmap(matrix=fitz.Matrix(3,3), clip=rect)
-                        img_qt = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
+                # Use shared helper to get full page image
+                img_bytes = get_page_image(doc, img_dir, real_p)
                 
-                # Fallback to local file if PDF failed or missing
-                if not img_qt and img_dir:
-                    candidates = [f"page_{real_p}", f"{real_p}"]
-                    exts = [".jpg", ".jpeg", ".png", ".bmp"]
+                if img_bytes:
+                    full_img = QImage()
+                    full_img.loadFromData(img_bytes)
                     
-                    found_path = None
-                    for c in candidates:
-                        for ext in exts:
-                             p = os.path.join(img_dir, c + ext)
-                             if os.path.exists(p):
-                                 found_path = p
-                                 break
-                        if found_path: break
+                    if not full_img.isNull():
+                        # Crop
+                        # Coordinates (x,y,w,h) in OCR JSON match the source image (extracted or rendered 3x)
+                        x, y, w, h = int(b['x']), int(b['y']), int(b['w']), int(b['h'])
+                        img_qt = full_img.copy(x, y, w, h)
                         
-                    if found_path:
-                         full_img = QImage(found_path)
-                         if not full_img.isNull():
-                             # Crop
-                             # Coordinates (x,y,w,h) in OCR JSON usually match pixel coordinates of the source image.
-                             # Check bounds
-                             x, y, w, h = int(b['x']), int(b['y']), int(b['w']), int(b['h'])
-                             img_qt = full_img.copy(x, y, w, h)
-                             
             except Exception as e:
                 print(f"Stitch crop error: {e}")
                 pass
@@ -1222,15 +1250,17 @@ class ImageStitcher:
 
 class ImageExportWorker(QThread):
     progress = pyqtSignal(str) # Message
+    progress_val = pyqtSignal(int) # Value
     finished = pyqtSignal(bool, str) # Success, Msg
 
-    def __init__(self, entries, project_config, fmt, export_dir, side):
+    def __init__(self, entries, project_config, fmt, export_dir, side, force_overwrite=False):
         super().__init__()
         self.entries = entries
         self.project_config = project_config
         self.fmt = fmt # 'json' or 'mdx'
         self.export_dir = export_dir
         self.side = side # 'left' or 'right'
+        self.force_overwrite = force_overwrite
         
         self.is_running = True
         
@@ -1244,7 +1274,7 @@ class ImageExportWorker(QThread):
             self.progress.emit("Initializing export...")
             
             # Prepare Image Dir
-            out_img_dir = os.path.join(self.export_dir, "output_images")
+            out_img_dir = os.path.join(self.export_dir, "output_slices")
             if not os.path.exists(out_img_dir):
                 os.makedirs(out_img_dir)
                 
@@ -1265,7 +1295,12 @@ class ImageExportWorker(QThread):
                 safe_hw = re.sub(r'[\\/*?:"<>|]', '_', headword)
                 safe_hw = safe_hw.strip()[:50]
                 
-                self.progress.emit(f"Processing ({i+1}/{total}): {headword}...")
+                safe_hw = safe_hw.strip()[:50]
+                
+                # OPTIMIZATION: Throttle UI updates (every 10 items or last item)
+                if i % 10 == 0 or i == total - 1:
+                    self.progress.emit(f"Processing ({i+1}/{total}): {headword}...")
+                    self.progress_val.emit(i + 1)
                 
                 # 1. Map
                 bboxes = self.mapper.find_bboxes(entry['text'], entry['pages'])
@@ -1274,33 +1309,55 @@ class ImageExportWorker(QThread):
                     # 2. Merge
                     merged = self.merger.merge(bboxes)
                     
-                    # 3. Stitch
+                    # 3. Predict Size & Check
                     # Determine orientation from first box label?
                     is_vertical = any(b['label'] == 'vertical_text' for b in bboxes)
                     
-                    stitched_img = self.stitcher.stitch(merged, doc, self.project_config.get('image_dir'), 
-                                                        self.project_config.get('page_offset', 0), is_vertical)
+                    pred_w, pred_h = self.stitcher.predict_size(merged, is_vertical)
                     
-                    if stitched_img:
-                        # 4. Save
-                        # Format: {page_num}_{page_index}.jpg
-                        # Use first page of entry?
-                        page_num = entry['pages'][0] if entry['pages'] else 0
-                        page_idx = entry.get('page_index', 0)
+                    if pred_w > 65500 or pred_h > 65500:
+                         self.progress.emit(f"SKIPPED {headword}: Size {pred_w}x{pred_h} > 65500")
+                         continue
+
+                    # 4. Save Path
+                    # Format: {page_num}_{page_index}.jpg
+                    page_num = entry['pages'][0] if entry['pages'] else 0
+                    page_idx = entry.get('page_index', 0)
+                    img_filename = f"{page_num}_{page_idx}.jpg"
+                    save_path = os.path.join(out_img_dir, img_filename)
+                    
+                    # 5. Skip Check (Force Re-split)
+                    should_stitch = True
+                    if not self.force_overwrite and os.path.exists(save_path):
+                        # check size
+                        try:
+                            reader = QImageReader(save_path)
+                            size = reader.size()
+                            if size.isValid():
+                                # Tolerance +/- 5px
+                                diff_w = abs(size.width() - pred_w)
+                                diff_h = abs(size.height() - pred_h)
+                                if diff_w < 5 and diff_h < 5:
+                                    should_stitch = False
+                                    # self.progress.emit(f"Skipped {headword} (Exists & Size Match)")
+                                # else:
+                                #    print(f"[DEBUG] Re-stitch {headword}: Existing {size.width()}x{size.height()} vs Pred {pred_w}x{pred_h}")
+                            # else:
+                            #    print(f"[DEBUG] Re-stitch {headword}: Existing invalid")
+                        except Exception as e:
+                             # print(f"[DEBUG] Re-stitch {headword}: Error check {e}")
+                             pass
+                    
+                    if should_stitch:
+                        stitched_img = self.stitcher.stitch(merged, doc, self.project_config.get('image_dir'), 
+                                                            self.project_config.get('page_offset', 0), is_vertical)
                         
-                        img_filename = f"{page_num}_{page_idx}.jpg"
-                        # Handle duplicate? (If multiple entries have same page/idx? Unlikely if logic correct)
-                        # But just in case
-                        save_path = os.path.join(out_img_dir, img_filename)
-                        stitched_img.save(save_path)
-                        
-                        # 5. Link
-                        # Relative path for JSON/MDX?
-                        # JSON: "output_images/filename.jpg"
-                        # MDX: <img src="output_images/filename.jpg" />
-                        
-                        rel_path = f"output_images/{img_filename}"
-                        entry['image_path'] = rel_path
+                        if stitched_img:
+                            stitched_img.save(save_path)
+                    
+                    # 6. Link
+                    rel_path = img_filename
+                    entry['image_path'] = rel_path
                         
                 # Update progress
                 
@@ -1317,7 +1374,7 @@ class ImageExportWorker(QThread):
                 elif self.fmt == 'mdx':
                     for e in self.entries:
                         f.write(f"{e['headword']}\n")
-                        f.write(f"{e['text']}\n")
+                        f.write(f"{e['text']}\n".replace('\n','<br>\n'))
                         if 'image_path' in e:
                             # MDX generic image tag
                             f.write(f'<img src="{e["image_path"]}" />\n')
@@ -1331,6 +1388,9 @@ class ImageExportWorker(QThread):
             self.finished.emit(False, str(e))
         finally:
             if doc: doc.close()
+
+    def stop(self):
+        self.is_running = False
 
 # ==========================================
 # 5. Export Logic (Generic Parser)
@@ -1956,7 +2016,7 @@ class MainWindow(QMainWindow):
         
         
         # Export Menu Button
-        self.btn_export_menu = QPushButton("Export...")
+        self.btn_export_menu = QPushButton("导出...")
         self.menu_export = QMenu(self)
         
         # Actions
@@ -1965,20 +2025,25 @@ class MainWindow(QMainWindow):
             a.triggered.connect(func)
             self.menu_export.addAction(a)
             
-        add_action("Export Current Page Slices", self.export_slices)
-        add_action("Export Current OCR Text (TXT)", self.export_ocr_dict_current)
+        add_action("导出当前页面切图", self.export_slices)
+        add_action("导出当前页面OCR文本", self.export_ocr_dict_current)
         self.menu_export.addSeparator()
-        add_action("Export ALL OCR Text (TXT)", self.export_all_ocr_txt)
+        add_action("导出所有页面OCR文本", self.export_all_ocr_txt)
         self.menu_export.addSeparator()
-        add_action("Export LEFT Text (.json)", lambda: self.export_parsed("left", "json"))
-        add_action("Export RIGHT Text (.json)", lambda: self.export_parsed("right", "json"))
-        add_action("Export LEFT Text (.mdx.txt)", lambda: self.export_parsed("left", "mdx"))
-        add_action("Export RIGHT Text (.mdx.txt)", lambda: self.export_parsed("right", "mdx"))
+        add_action("导出左侧文本(.json)", lambda: self.export_parsed("left", "json"))
+        add_action("导出右侧文本(.json)", lambda: self.export_parsed("right", "json"))
+        add_action("导出左侧文本(.mdx.txt)", lambda: self.export_parsed("left", "mdx"))
+        add_action("导出右侧文本(.mdx.txt)", lambda: self.export_parsed("right", "mdx"))
         self.menu_export.addSeparator()
-        add_action("Export LEFT JSON + Images", lambda: self.export_parsed_with_images("left", "json"))
-        add_action("Export RIGHT JSON + Images", lambda: self.export_parsed_with_images("right", "json"))
-        add_action("Export LEFT MDX + Images", lambda: self.export_parsed_with_images("left", "mdx"))
-        add_action("Export RIGHT MDX + Images", lambda: self.export_parsed_with_images("right", "mdx"))
+        add_action("导出左侧文本(.json)+图片", lambda: self.export_parsed_with_images("left", "json"))
+        add_action("导出右侧文本(.json)+图片", lambda: self.export_parsed_with_images("right", "json"))
+        add_action("导出左侧文本(.mdx.txt)+图片", lambda: self.export_parsed_with_images("left", "mdx"))
+        add_action("导出右侧文本(.mdx.txt)+图片", lambda: self.export_parsed_with_images("right", "mdx"))
+        
+        self.menu_export.addSeparator()
+        self.action_force_recreate = QAction("强制重新生成图片", self, checkable=True)
+        self.action_force_recreate.setChecked(False)
+        self.menu_export.addAction(self.action_force_recreate)
         
         self.btn_export_menu.setMenu(self.menu_export)
         toolbar.addWidget(self.btn_export_menu)
@@ -2241,9 +2306,9 @@ class MainWindow(QMainWindow):
     def get_best_page_image_bytes(self, doc, page_num):
         """Extract High-Res or Raw image from PDF"""
         try:
-             idx = page_num + self.project_config['page_offset'] - 1
-             if 0 < idx <= len(doc):
-                 page = doc[idx - 1]
+             real_page_num = page_num + self.project_config.get('page_offset', 0)
+             if 0 < real_page_num <= len(doc):
+                 page = doc[real_page_num - 1]
                  
                  # 1. Try Extract Raw Image (scanned PDF)
                  try:
@@ -2939,7 +3004,7 @@ class MainWindow(QMainWindow):
                 elif fmt == 'mdx':
                     for e in entries:
                         f.write(f"{e['headword']}\n")
-                        f.write(f"{e['text']}\n")
+                        f.write(f"{e['text']}\n".replace('\n','<br>\n'))
                         f.write("</>\n")
                         
             QMessageBox.information(self, "Success", f"Exported {len(entries)} entries to {filename}")
@@ -2957,6 +3022,12 @@ class MainWindow(QMainWindow):
         if not export_dir or not os.path.exists(export_dir):
             export_dir = QFileDialog.getExistingDirectory(self, "Select Export Directory")
             if not export_dir: return
+            
+            # Update config if new selection
+            self.project_config["export_dir"] = export_dir
+            self.config_manager.save()
+            
+        force_overwrite = self.action_force_recreate.isChecked()
         
         # 2. Get Data
         pages = self.pages_left if side == 'left' else self.pages_right_text
@@ -2983,19 +3054,20 @@ class MainWindow(QMainWindow):
             return
 
         # 4. Start Background Worker
-        self.img_export_worker = ImageExportWorker(entries, self.project_config, fmt, export_dir, side)
+        self.img_export_worker = ImageExportWorker(entries, self.project_config, fmt, export_dir, side, force_overwrite)
         
         # Progress Dialog
         from PyQt6.QtWidgets import QProgressDialog
-        self.progress_dlg = QProgressDialog("Exporting Images...", "Cancel", 0, 0, self)
+        self.progress_dlg = QProgressDialog("Exporting Images...", "Cancel", 0, len(entries), self)
         self.progress_dlg.setWindowTitle("Exporting")
         self.progress_dlg.setWindowModality(Qt.WindowModality.WindowModal)
         self.progress_dlg.setMinimumDuration(0)
         self.progress_dlg.show()
         
         self.img_export_worker.progress.connect(self.progress_dlg.setLabelText)
+        self.img_export_worker.progress_val.connect(self.progress_dlg.setValue)
         self.img_export_worker.finished.connect(self.on_img_export_finished)
-        self.progress_dlg.canceled.connect(self.img_export_worker.terminate) # Or stop flag
+        self.progress_dlg.canceled.connect(self.img_export_worker.stop) 
         
         self.img_export_worker.start()
 

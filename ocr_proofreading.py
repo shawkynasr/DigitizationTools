@@ -9,7 +9,7 @@ import base64
 import time
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QTextEdit, QLabel, QPushButton, QSplitter, QFileDialog, 
+                             QTextEdit, QLabel, QPushButton, QSplitter, QFileDialog, QInputDialog,
                              QMessageBox, QListWidget, QGraphicsView, QGraphicsScene, 
                              QGraphicsRectItem, QGraphicsPixmapItem, QLineEdit, 
                              QFormLayout, QDialog, QDialogButtonBox, QSpinBox, 

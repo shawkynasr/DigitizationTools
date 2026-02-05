@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
 from PyQt6.QtGui import (QTextCursor, QColor, QSyntaxHighlighter, QTextCharFormat, QTextFormat,
                          QAction, QPixmap, QImage, QPainter, QBrush, QPen, QFont, QImageReader, QTextOption)
 from PyQt6.QtWidgets import QProgressBar
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QEvent, QThread, pyqtSlot, QSize, QRect
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QEvent, QThread, pyqtSlot, QSize, QRect, QPoint
 import bisect
 
 
@@ -2670,39 +2670,21 @@ class MainWindow(QMainWindow):
         return to_qt_pos(dst_text, mapped_py_idx)
 
     def on_scroll(self, source, target):
-        """基于内容的对齐滚动"""
+        """Percentage-based scroll sync"""
         if self._is_program_scrolling: return
         
-        # 获取 Source 视口最顶端的字符索引
-        # cursorForPosition(0,0) 获取的是 visual line 的开始
-        # 为了更准确，可以取一点 margin，比如 (5, 5)
-        top_cursor = source.cursorForPosition(source.viewport().rect().topLeft())
-        src_idx = top_cursor.position()
+        self._is_program_scrolling = True
         
-        is_left = (source == self.edit_left)
+        # Calculate ratio
+        s_bar = source.verticalScrollBar()
+        t_bar = target.verticalScrollBar()
         
-        # 映射到 Target
-        dst_idx = self.get_mapped_index(src_idx, is_left)
-        
-        if dst_idx >= 0:
-            self._is_program_scrolling = True
+        if s_bar.maximum() > 0:
+            ratio = s_bar.value() / s_bar.maximum()
+            t_val = int(ratio * t_bar.maximum())
+            t_bar.setValue(t_val)
             
-            # 计算目标位置的 Y 坐标
-            # 方法：找到 dst_idx 所在的 block，获取其 bounding rect
-            doc = target.document()
-            block = doc.findBlock(dst_idx)
-            layout = doc.documentLayout()
-            
-            # blockBoundingRect 返回的是相对于文档的坐标
-            block_rect = layout.blockBoundingRect(block)
-            
-            # 也可以更精细：如果是 wrap 过的长行，blockBoundingRect 是整个 block 的
-            # 我们只需要大致对齐 block 即可
-            target_y = block_rect.y()
-            
-            target.verticalScrollBar().setValue(int(target_y))
-            
-            self._is_program_scrolling = False
+        self._is_program_scrolling = False
 
     def request_highlight_other(self, source_editor, idx):
         """根据当前光标位置，高亮另一侧对应位置"""
@@ -2717,6 +2699,19 @@ class MainWindow(QMainWindow):
         
         if mapped_idx >= 0:
             target_editor.highlight_line_at_index(mapped_idx)
+            
+            # Ensure Visible
+            cursor = target_editor.textCursor()
+            cursor.setPosition(mapped_idx)
+            
+            # Check if visual rect is in viewport
+            r = target_editor.cursorRect(cursor)
+            viewport_rect = target_editor.viewport().rect()
+            
+            if not viewport_rect.contains(r):
+                # Move actual cursor to center it
+                target_editor.setTextCursor(cursor)
+                target_editor.centerCursor()
         else:
             # 如果没找到映射（比如超出范围），也清除对面
             target_editor.clear_highlight()

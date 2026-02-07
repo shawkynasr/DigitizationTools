@@ -517,12 +517,22 @@ class DiffTextEdit(QPlainTextEdit):
     focus_in_signal = pyqtSignal()
     # 信号：点击了某个 Diff 块，请求应用到另一侧 (self_index_range, target_text)
     apply_patch_signal = pyqtSignal(tuple, str)
+    # 信号：Alt+Click 将本侧内容推送到另一侧 (target_range, my_content)
+    push_patch_signal = pyqtSignal(tuple, str)
+    # 信号：Ctrl+Wheel 缩放请求 (delta)
+    zoom_signal = pyqtSignal(int)
 
     def focusInEvent(self, event):
         self.focus_in_signal.emit()
         super().focusInEvent(event)
-    # 信号：Alt+Click 将本侧内容推送到另一侧 (target_range, my_content)
-    push_patch_signal = pyqtSignal(tuple, str)
+    
+    def wheelEvent(self, event):
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            # Emit zoom signal, consume event
+            self.zoom_signal.emit(event.angleDelta().y())
+            event.accept()
+        else:
+            super().wheelEvent(event)
     
     def __init__(self, side="left"):
         super().__init__()
@@ -531,10 +541,6 @@ class DiffTextEdit(QPlainTextEdit):
         self.other_text_content = "" # 另一侧的完整文本，用于提取
         self.setFont(QFont("Consolas", 11))
         
-        # 启用鼠标追踪以支持 Hover
-        self.setMouseTracking(True)
-        self._hovering_diff = False
-
         # 启用鼠标追踪以支持 Hover
         self.setMouseTracking(True)
         self._hovering_diff = False
@@ -3021,6 +3027,9 @@ class FindReplaceDialog(QDialog):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if ret == QMessageBox.StandardButton.No: return
         
+        # Save current page first!
+        self.mainwindow.save_current_page_data()
+        
         # Get all page keys
         if self.rb_left.isChecked():
             pages = list(self.mainwindow.pages_left.keys())
@@ -3122,13 +3131,15 @@ class FindReplaceDialog(QDialog):
                 txt = target_dict[p_key]
                 # re.sub with function
                 new_txt, n = regex.subn(repl_func, txt)
+                
                 if n > 0:
                     target_dict[p_key] = new_txt
                     self.mainwindow.mark_page_dirty(p_key, target_is_left)
                     count += n
             
             # Reload if current page affected
-            self.mainwindow.reload_displayed_texts()
+            if hasattr(self.mainwindow, 'force_ui_reload'):
+                self.mainwindow.force_ui_reload()
 
         self.status_label.setText(f"Replaced {count} occurrences.")
 
@@ -3211,6 +3222,9 @@ class FindReplaceDialog(QDialog):
         
         to_apply.sort(key=lambda x: (int(x['page_num']), x['span'][0]), reverse=True)
         
+        # Save current page first!
+        self.mainwindow.save_current_page_data()
+        
         if self.review_is_global:
             self.mainwindow.push_global_undo("Review Apply")
             
@@ -3226,33 +3240,35 @@ class FindReplaceDialog(QDialog):
         except: curr_p = -999
             
         for p_num, items in by_page.items():
-            txt = ""
-            is_current = False
+            # Always load from memory since we just saved current page
+            txt = target_dict.get(p_num, "")
             
-            if p_num == curr_p and not self.review_is_global:
-                 txt = self.get_target_editor().toPlainText()
-                 is_current = True
-            else:
-                 txt = target_dict.get(p_num, "")
-
+            # Create new text by applying patches
+            # Since items are sorted reverse, index shifting is handled?
+            # Items are sorted by page THEN span start desc.
+            # But here `items` is list for ONE page.
+            # Need to ensure `items` for this page are sorted reverse by start index.
+            items.sort(key=lambda x: x['span'][0], reverse=True)
+            
             new_txt = txt
             for item in items:
                 start, end = item['span']
                 repl_t = item['new']
+                # Verify context match
                 if new_txt[start:end] == item['original']:
                      new_txt = new_txt[:start] + repl_t + new_txt[end:]
                      count += 1
-
-            if is_current and not self.review_is_global:
-                cursor = self.get_target_editor().textCursor()
-                cursor.select(QTextCursor.SelectionType.Document)
-                cursor.insertText(new_txt)
-            else:
-                target_dict[p_num] = new_txt
-                self.mainwindow.mark_page_dirty(p_num, self.rb_left.isChecked())
-                
+            
+            # Update memory
+            target_dict[p_num] = new_txt
+            self.mainwindow.mark_page_dirty(p_num, self.rb_left.isChecked())
+            
         if self.review_is_global:
-            self.mainwindow.reload_displayed_texts()
+            if hasattr(self.mainwindow, 'force_ui_reload'): self.mainwindow.force_ui_reload()
+        else:
+            # If local review, we might not be in global mode, but still affecting current page
+            # Just reload to be safe and consistent
+            if hasattr(self.mainwindow, 'force_ui_reload'): self.mainwindow.force_ui_reload()
             
         self.close_review()
         self.status_label.setText(f"Applied {count} changes.")
@@ -3616,6 +3632,8 @@ class MainWindow(QMainWindow):
         self.last_active_editor = None
         self._is_navigating_from_image = False
         self._is_loading = False
+        self._is_program_scrolling = False # 防止滚动条死循环
+        self._is_syncing_cursor = False    # 防止光标同步死循环
         
         # Compat: Map self.config to project_config for easy refactor, 
         # but manual access to global_config is needed for OCR.
@@ -3872,9 +3890,6 @@ class MainWindow(QMainWindow):
         self.edit_left.push_patch_signal.connect(lambda r, t: self.apply_patch(self.edit_right, r, t))
         self.edit_right.push_patch_signal.connect(lambda r, t: self.apply_patch(self.edit_left, r, t))
         
-        # 绑定滚动同步 (屏蔽默认)
-        # self.edit_left.verticalScrollBar().valueChanged.connect(self.sync_scroll_to_right)
-        # self.edit_right.verticalScrollBar().valueChanged.connect(self.sync_scroll_to_left)
         # 使用自定义的滚动监听，因为需要判断是否由用户触发
         self.edit_left.verticalScrollBar().valueChanged.connect(lambda v: self.on_scroll(self.edit_left, self.edit_right))
         self.edit_right.verticalScrollBar().valueChanged.connect(lambda v: self.on_scroll(self.edit_right, self.edit_left))
@@ -3882,6 +3897,10 @@ class MainWindow(QMainWindow):
         # 绑定光标移动 (高亮对齐 & 自动滚动)
         self.edit_left.cursorPositionChanged.connect(self.on_cursor_left)
         self.edit_right.cursorPositionChanged.connect(self.on_cursor_right)
+        
+        # 绑定缩放 (Ctrl+Wheel)
+        self.edit_left.zoom_signal.connect(self.on_zoom_request)
+        self.edit_right.zoom_signal.connect(self.on_zoom_request)
         
         # 标记是否正在编程滚动，防止死循环
         self._is_program_scrolling = False
@@ -4045,6 +4064,27 @@ class MainWindow(QMainWindow):
 
             # Force run immediately for first load? Or use deferred?
             # Use deferred to keep it async
+            self.deferred_run_diff()
+        finally:
+            self._is_loading = False
+
+    def force_ui_reload(self):
+        """Force reload current page texts from memory dicts"""
+        self._is_loading = True
+        try:
+            p = self.current_loaded_page
+            if p is None: return
+            
+            # Left
+            text_l = self.pages_left.get(p, "")
+            self.edit_left.setPlainText(text_l)
+            
+            # Right
+            if self.combo_source.currentText() == "Text File B":
+                text_r = self.pages_right_text.get(p, "")
+                self.edit_right.setPlainText(text_r)
+                
+            # Trigger diff update
             self.deferred_run_diff()
         finally:
             self._is_loading = False
@@ -4309,6 +4349,27 @@ class MainWindow(QMainWindow):
         
         self.run_diff()
 
+    def on_zoom_request(self, delta):
+        """Synchronized Font Zoom (Ctrl+Wheel)"""
+        font = self.edit_left.font()
+        size = font.pointSize()
+        
+        if delta > 0:
+            size += 1
+        else:
+            size -= 1
+            
+        # Clamp
+        size = max(6, min(size, 72))
+        
+        font.setPointSize(size)
+        self.edit_left.setFont(font)
+        self.edit_right.setFont(font)
+        
+        # Force line number update
+        self.edit_left.update_line_number_area_width(0)
+        self.edit_right.update_line_number_area_width(0)
+
     def toggle_word_wrap(self, checked):
         mode = QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere if checked else QTextOption.WrapMode.NoWrap
         self.edit_left.setWordWrapMode(mode)
@@ -4375,6 +4436,8 @@ class MainWindow(QMainWindow):
     def on_scroll(self, source, target):
         """Percentage-based scroll sync"""
         if self._is_program_scrolling: return
+        # Don't sync scroll if we are actively syncing cursor (which handles its own visibility)
+        if hasattr(self, '_is_syncing_cursor') and self._is_syncing_cursor: return
         
         self._is_program_scrolling = True
         
@@ -4498,17 +4561,27 @@ class MainWindow(QMainWindow):
                 return
 
     def on_cursor_left(self):
-        idx = self.edit_left.textCursor().position()
-        self.request_highlight_other(self.edit_left, idx)
-        # 增加：检查左侧光标对应的 BBox
-        if not self._is_navigating_from_image:
-             self.check_auto_scroll_bbox(self.edit_left, idx)
+        if self._is_syncing_cursor: return
+        self._is_syncing_cursor = True
+        try:
+            idx = self.edit_left.textCursor().position()
+            self.request_highlight_other(self.edit_left, idx)
+            # 增加：检查左侧光标对应的 BBox
+            if not self._is_navigating_from_image:
+                 self.check_auto_scroll_bbox(self.edit_left, idx)
+        finally:
+            self._is_syncing_cursor = False
 
     def on_cursor_right(self):
-        idx = self.edit_right.textCursor().position()
-        self.request_highlight_other(self.edit_right, idx)
-        if not self._is_navigating_from_image:
-             self.check_auto_scroll_bbox(self.edit_right, idx)
+        if self._is_syncing_cursor: return
+        self._is_syncing_cursor = True
+        try:
+            idx = self.edit_right.textCursor().position()
+            self.request_highlight_other(self.edit_right, idx)
+            if not self._is_navigating_from_image:
+                 self.check_auto_scroll_bbox(self.edit_right, idx)
+        finally:
+            self._is_syncing_cursor = False
 
     # ================= 功能 =================
 

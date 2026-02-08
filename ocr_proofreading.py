@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QFormLayout, QDialog, QDialogButtonBox, QSpinBox, 
                              QTabWidget, QToolBar, QComboBox, QCheckBox, QMenu,
                              QRadioButton, QButtonGroup, QGroupBox, QListWidgetItem, QGridLayout,
-                             QTableView, QHeaderView, QAbstractItemView, QStyle, QProgressDialog)
+                             QTableView, QHeaderView, QAbstractItemView, QStyle, QProgressDialog, QSizePolicy)
 from PyQt6.QtGui import (QTextCursor, QColor, QSyntaxHighlighter, QTextCharFormat, QTextFormat,
                          QAction, QPixmap, QImage, QPainter, QBrush, QPen, QFont, QImageReader, QTextOption,
                          QAbstractTextDocumentLayout, QTextDocument, QPalette)
@@ -32,13 +32,13 @@ class ReviewTableModel(QAbstractTableModel):
     def __init__(self, data):
         super().__init__()
         self._data = data # List of dicts
-        self._headers = ["", "Page", "Change Context"]
+        self._headers = ["", "Page", "Line", "Col", "Change Context"]
 
     def rowCount(self, parent=None):
         return len(self._data)
 
     def columnCount(self, parent=None):
-        return 3
+        return 5
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid(): return None
@@ -48,7 +48,9 @@ class ReviewTableModel(QAbstractTableModel):
         
         if role == Qt.ItemDataRole.DisplayRole:
             if col == 1: return str(item['page_num'])
-            # Col 2 Handled by Delegate
+            if col == 2: return str(item.get('line', ''))
+            if col == 3: return str(item.get('col', ''))
+            # Col 4 Handled by Delegate
             return None
         
         if role == Qt.ItemDataRole.CheckStateRole and col == 0:
@@ -76,24 +78,25 @@ class ReviewTableModel(QAbstractTableModel):
 
 class HtmlDelegate(QStyledItemDelegate):
     def paint(self, painter, option, index):
-        if index.column() == 2:
+        if index.column() == 4:
             painter.save()
             
             doc = QTextDocument()
             html = index.model()._data[index.row()].get('context_html', '')
             
-            width = option.rect.width()
+            # Subtract padding
+            width = option.rect.width() - 10
             if width <= 0: width = 200
             
             doc.setHtml(html)
             doc.setTextWidth(width)
             doc.setDefaultFont(option.font)
             
-            painter.translate(option.rect.topLeft())
+            painter.translate(option.rect.topLeft() + QPoint(5, 5))
             
             # Custom Selection Highlight
             if option.state & QStyle.StateFlag.State_Selected:
-                 painter.fillRect(QRect(0, 0, width, int(doc.size().height())), QColor("#E0E0FF"))
+                 painter.fillRect(QRect(-5, -5, width+10, int(doc.size().height())+10), QColor("#E0E0FF"))
             
             ctx = QAbstractTextDocumentLayout.PaintContext()
             doc.documentLayout().draw(painter, ctx)
@@ -102,18 +105,24 @@ class HtmlDelegate(QStyledItemDelegate):
             super().paint(painter, option, index)
 
     def sizeHint(self, option, index):
-        if index.column() == 2:
+        if index.column() == 4:
             doc = QTextDocument()
             doc.setHtml(index.model()._data[index.row()].get('context_html', ''))
             
+            # Use specific column width from the view if available
             width = option.rect.width()
-            if width <= 0: width = 200
+            if self.parent(): # Assuming parent is the view
+                 width = self.parent().columnWidth(4)
+                 
+            # Allow some padding in calculation
+            text_width = width - 10
+            if text_width <= 50: text_width = 400 # Default fallback
             
-            doc.setTextWidth(width)
+            doc.setTextWidth(text_width)
             doc.setDefaultFont(option.font)
             
             h = int(doc.size().height())
-            return QSize(int(doc.idealWidth()), h + 15)
+            return QSize(int(doc.idealWidth()), h + 15) # Add padding
         return super().sizeHint(option, index)
 
 # ==========================================
@@ -204,7 +213,9 @@ except ImportError:
 DEFAULT_GLOBAL_CONFIG = {
     "ocr_api_url": "",
     "ocr_api_token": "",
-    "ocr_engine": "remote" # remote or local
+    "ocr_engine": "remote", # remote or local
+    "find_history": [],
+    "replace_history": []
 }
 
 DEFAULT_PROJECT_CONFIG = {
@@ -2231,6 +2242,8 @@ class TemplateEditorDialog(QDialog):
         h_name.addWidget(self.txt_name)
         layout.addLayout(h_name)
         
+
+        
         # Rules List
         self.list_rules = QListWidget()
         self.list_rules.itemDoubleClicked.connect(self.edit_rule)
@@ -2522,10 +2535,32 @@ class FindReplaceDialog(QDialog):
         self.review_group = QGroupBox("Review Replacements")
         self.review_group.setVisible(False)
         rev_layout = QVBoxLayout(self.review_group)
+        
+        # Selection Controls (Wrapper for hiding)
+        self.review_top_widget = QWidget()
+        h_sel = QHBoxLayout(self.review_top_widget)
+        h_sel.setContentsMargins(0,0,0,0)
+        
+        self.btn_sel_all = QPushButton("Select All")
+        self.btn_sel_all.clicked.connect(self.select_all_review)
+        self.btn_sel_none = QPushButton("Select None")
+        self.btn_sel_none.clicked.connect(self.deselect_all_review)
+        self.btn_sel_toggle = QPushButton("Toggle Selection (Space)")
+        self.btn_sel_toggle.clicked.connect(self.toggle_review_selection)
+        self.btn_sel_toggle.setShortcut("Space")
+        
+        h_sel.addWidget(self.btn_sel_all)
+        h_sel.addWidget(self.btn_sel_none)
+        h_sel.addWidget(self.btn_sel_toggle)
+        h_sel.addStretch()
+        
+        rev_layout.addWidget(self.review_top_widget)
+        
         self.review_table = QTableView()
         self.review_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.review_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.review_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.review_table.verticalHeader().setVisible(False)
+        self.review_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.review_table.horizontalHeader().setStretchLastSection(True)
         # Custom Delegate
         self.review_table.setItemDelegate(HtmlDelegate(self.review_table))
@@ -2536,12 +2571,12 @@ class FindReplaceDialog(QDialog):
         rev_layout.addWidget(self.review_table)
         
         h_rev = QHBoxLayout()
-        btn_rev_apply = QPushButton("Apply Selected")
-        btn_rev_apply.clicked.connect(self.apply_review_selection)
-        btn_rev_cancel = QPushButton("Cancel Review")
-        btn_rev_cancel.clicked.connect(self.close_review)
-        h_rev.addWidget(btn_rev_apply)
-        h_rev.addWidget(btn_rev_cancel)
+        self.btn_rev_apply = QPushButton("Apply Selected")
+        self.btn_rev_apply.clicked.connect(self.apply_review_selection)
+        self.btn_rev_cancel = QPushButton("Cancel Review")
+        self.btn_rev_cancel.clicked.connect(self.close_review)
+        h_rev.addWidget(self.btn_rev_apply)
+        h_rev.addWidget(self.btn_rev_cancel)
         rev_layout.addLayout(h_rev)
         
         main_layout.addWidget(self.review_group)
@@ -2554,32 +2589,109 @@ class FindReplaceDialog(QDialog):
         self.template_manager = TemplateManager()
         self.refresh_combo_templates()
         
+        # Load History
+        self.load_history()
+        
+    def load_history(self):
+        """Load Find/Replace history from global config"""
+        f_hist = self.mainwindow.global_config.get("find_history", [])
+        r_hist = self.mainwindow.global_config.get("replace_history", [])
+        
+        self.cb_find.clear()
+        self.cb_find.addItems(f_hist)
+        self.cb_find.setCurrentIndex(-1)
+        
+        self.cb_replace.clear()
+        self.cb_replace.addItems(r_hist)
+        self.cb_replace.setCurrentIndex(-1)
+        
+    def save_search_history(self):
+        """Save current find/replace terms to history"""
+        f_txt = self.cb_find.currentText().strip()
+        r_txt = self.cb_replace.currentText().strip()
+        
+        f_hist = self.mainwindow.global_config.get("find_history", [])
+        r_hist = self.mainwindow.global_config.get("replace_history", [])
+        
+        # Helper to update list
+        def update_list(lst, item):
+            if not item: return False
+            changed = False
+            if item in lst:
+                lst.remove(item)
+                changed = True
+            lst.insert(0, item)
+            # Limit size
+            while len(lst) > 20: 
+                lst.pop()
+                changed = True
+            return True # Always true if item added
+            
+        f_changed = update_list(f_hist, f_txt)
+        r_changed = update_list(r_hist, r_txt)
+        
+        if f_changed or r_changed:
+            self.mainwindow.global_config["find_history"] = f_hist
+            self.mainwindow.global_config["replace_history"] = r_hist
+            self.mainwindow.config_manager.save()
+            
+            # Dynamic UI Refresh
+            # Block signals to prevent recursion if we had currentIndexChanged connected
+            self.cb_find.blockSignals(True)
+            self.cb_replace.blockSignals(True)
+            
+            curr_f = self.cb_find.currentText()
+            curr_r = self.cb_replace.currentText()
+            
+            self.cb_find.clear()
+            self.cb_find.addItems(f_hist)
+            self.cb_find.setEditText(curr_f) # Restore text
+            
+            self.cb_replace.clear()
+            self.cb_replace.addItems(r_hist)
+            self.cb_replace.setEditText(curr_r) # Restore text
+
+            self.cb_find.blockSignals(False)
+            self.cb_replace.blockSignals(False)
+        
     def init_tab_standard(self):
         layout = QGridLayout(self.tab_standard)
         
+        # Row 0: Find and Replace Inputs (Side by Side)
+        h_inputs = QHBoxLayout()
+        
         # Find
-        layout.addWidget(QLabel("Find:"), 0, 0)
+        self.lbl_find = QLabel("Find:")
         self.cb_find = QComboBox()
         self.cb_find.setEditable(True)
-        layout.addWidget(self.cb_find, 0, 1)
+        self.cb_find.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         
-        # Source Chars (Hidden by default)
+        # Replace
+        self.lbl_replace = QLabel("Replace:")
+        self.cb_replace = QComboBox()
+        self.cb_replace.setEditable(True)
+        self.cb_replace.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        
+        h_inputs.addWidget(self.lbl_find)
+        h_inputs.addWidget(self.cb_find, 2) # weight 2
+        h_inputs.addWidget(self.lbl_replace)
+        h_inputs.addWidget(self.cb_replace, 2) 
+        
+        layout.addLayout(h_inputs, 0, 0, 1, 2)
+        
+        # Row 1: Source Chars (Hidden by default) - Translate Mode
         self.lbl_src_chars = QLabel("Source Chars:")
         self.cb_src_chars = QComboBox()
         self.cb_src_chars.setEditable(True)
         self.lbl_src_chars.setVisible(False)
         self.cb_src_chars.setVisible(False)
-        layout.addWidget(self.lbl_src_chars, 1, 0)
-        layout.addWidget(self.cb_src_chars, 1, 1)
-
-        # Replace (Target Chars) - Moved to Row 2
-        self.lbl_replace = QLabel("Replace:")
-        layout.addWidget(self.lbl_replace, 2, 0)
-        self.cb_replace = QComboBox()
-        self.cb_replace.setEditable(True)
-        layout.addWidget(self.cb_replace, 2, 1)
         
-        # Options - Row 3
+        h_src = QHBoxLayout()
+        h_src.addWidget(self.lbl_src_chars)
+        h_src.addWidget(self.cb_src_chars)
+        layout.addLayout(h_src, 1, 0, 1, 2)
+
+        # Row 2: Options
         opt_layout = QHBoxLayout()
         self.chk_case = QCheckBox("Case Sensitive")
         self.chk_word = QCheckBox("Whole Word")
@@ -2590,54 +2702,82 @@ class FindReplaceDialog(QDialog):
         opt_layout.addWidget(self.chk_word)
         opt_layout.addWidget(self.chk_regex)
         opt_layout.addWidget(self.chk_extended)
-        layout.addLayout(opt_layout, 3, 0, 1, 2)
+        layout.addLayout(opt_layout, 2, 0, 1, 2)
         
-        # Replace Mode - Row 4
+        # Row 3: Replace Mode
         h = QHBoxLayout()
         h.addWidget(QLabel("Replace Mode:"))
         self.combo_repl_mode = QComboBox()
         self.combo_repl_mode.addItems(["Normal", "Regex Group ($1)", "Python Lambda (match -> str)", "Translate (Char -> Char)"])
         self.combo_repl_mode.currentTextChanged.connect(self.on_mode_changed)
         h.addWidget(self.combo_repl_mode)
-        layout.addLayout(h, 4, 0, 1, 2)
+        layout.addLayout(h, 3, 0, 1, 2)
         
-        # Buttons - Row 5
-        grid_btns = QGridLayout()
-        self.btn_find_next = QPushButton("Find Next")
-        self.btn_replace = QPushButton("Replace")
-        self.btn_replace_all_page = QPushButton("Replace All (Page)")
-        self.btn_replace_all_global = QPushButton("Replace All (Global)")
-        self.btn_review = QPushButton("Review (Page)")
-        self.btn_review_global = QPushButton("Review (Global)")
-        self.btn_count = QPushButton("Count Matches")
+        # Row 4: Actions
+        bg_act = QGroupBox("Actions")
+        v_act = QVBoxLayout(bg_act)
         
-        grid_btns.addWidget(self.btn_find_next, 0, 0)
-        grid_btns.addWidget(self.btn_replace, 0, 1)
-        grid_btns.addWidget(self.btn_replace_all_page, 1, 0)
-        grid_btns.addWidget(self.btn_replace_all_global, 1, 1)
-        grid_btns.addWidget(self.btn_review, 2, 0)
-        grid_btns.addWidget(self.btn_review_global, 2, 1)
-        grid_btns.addWidget(self.btn_count, 3, 0, 1, 2)
+        # Row 1: Find Next | Replace (Current)
+        h_row1 = QHBoxLayout()
+        btn_find = QPushButton("Find Next")
+        btn_find.clicked.connect(self.on_find_next)
+        btn_repl = QPushButton("Replace")
+        btn_repl.clicked.connect(self.on_replace)
+        h_row1.addWidget(btn_find)
+        h_row1.addWidget(btn_repl)
         
-        layout.addLayout(grid_btns, 5, 0, 1, 2)
-        layout.setRowStretch(6, 1)
-
+        # Row 2: Find All (Page) | Find All (Global)
+        h_row2 = QHBoxLayout()
+        btn_find_all_page = QPushButton("Find All (Page)")
+        btn_find_all_page.clicked.connect(self.on_find_all_page)
+        btn_find_all_global = QPushButton("Find All (Global)")
+        btn_find_all_global.clicked.connect(self.on_find_all_global)
+        h_row2.addWidget(btn_find_all_page)
+        h_row2.addWidget(btn_find_all_global)
         
-        # Connects
-        self.btn_find_next.clicked.connect(self.on_find_next)
-        self.btn_replace.clicked.connect(self.on_replace)
-        self.btn_replace_all_page.clicked.connect(self.on_replace_all_page)
-        self.btn_replace_all_global.clicked.connect(self.on_replace_all_global)
-        self.btn_review.clicked.connect(lambda: self.on_review(is_global=False))
-        self.btn_review_global.clicked.connect(lambda: self.on_review(is_global=True))
-        self.btn_count.clicked.connect(self.on_count)
+        # Row 3: Count (Page) | Count (Global)
+        h_row3 = QHBoxLayout()
+        btn_count_page = QPushButton("Count (Page)")
+        btn_count_page.clicked.connect(self.on_count_page)
+        btn_count_global = QPushButton("Count (Global)")
+        btn_count_global.clicked.connect(self.on_count_global)
+        h_row3.addWidget(btn_count_page)
+        h_row3.addWidget(btn_count_global)
+        
+        # Row 4: Replace All (Page) | Replace All (Global)
+        h_row4 = QHBoxLayout()
+        btn_repl_all = QPushButton("Replace All (Page)")
+        btn_repl_all.clicked.connect(self.on_replace_all_page)
+        btn_repl_global = QPushButton("Replace All (Global)")
+        btn_repl_global.clicked.connect(self.on_replace_all_global)
+        h_row4.addWidget(btn_repl_all)
+        h_row4.addWidget(btn_repl_global)
+        
+        # Row 5: Review (Page) | Review (Global)
+        h_row5 = QHBoxLayout()
+        btn_review = QPushButton("Review (Page)")
+        btn_review.clicked.connect(lambda: self.on_review(is_global=False))
+        btn_review_global = QPushButton("Review (Global)")
+        btn_review_global.clicked.connect(lambda: self.on_review(is_global=True))
+        h_row5.addWidget(btn_review)
+        h_row5.addWidget(btn_review_global)
+        
+        # Add to Layout
+        v_act.addLayout(h_row1)
+        v_act.addLayout(h_row2)
+        v_act.addLayout(h_row3)
+        v_act.addLayout(h_row4)
+        v_act.addLayout(h_row5)
+        
+        layout.addWidget(bg_act, 4, 0, 1, 2)
+        
+        layout.setRowStretch(5, 1)
         
     def on_mode_changed(self, text):
         if "Translate" in text:
             # Change Labels
             self.tabs.setTabText(0, "Translate")
-            self.find_label_origin = self.tab_standard.layout().itemAtPosition(0,0).widget()
-            if isinstance(self.find_label_origin, QLabel): self.find_label_origin.setText("Filter (Optional):")
+            self.lbl_find.setText("Filter (Optional):")
             self.lbl_replace.setText("Target Chars:")
             self.cb_find.setPlaceholderText("Filter Pattern (or leave empty)")
             self.cb_replace.setPlaceholderText("Target characters")
@@ -2647,15 +2787,7 @@ class FindReplaceDialog(QDialog):
             self.cb_src_chars.setVisible(True)
         else:
              self.tabs.setTabText(0, "Standard / Regex")
-             find_lbl = self.tab_standard.layout().itemAtPosition(0,0).widget()
-             if isinstance(find_lbl, QLabel): find_lbl.setText("Find:")
-             self.lbl_replace.setText("Replace:")
-             self.cb_find.setPlaceholderText("")
-             self.cb_replace.setPlaceholderText("")
-             
-             self.lbl_src_chars.setVisible(False)
-             self.cb_src_chars.setVisible(False)
-             if isinstance(find_lbl, QLabel): find_lbl.setText("Find:")
+             self.lbl_find.setText("Find:")
              self.lbl_replace.setText("Replace:")
              self.cb_find.setPlaceholderText("")
              self.cb_replace.setPlaceholderText("")
@@ -2664,6 +2796,7 @@ class FindReplaceDialog(QDialog):
              self.cb_src_chars.setVisible(False)
 
     def on_find_next(self):
+        self.save_search_history()
         regex = self._compile_regex_from_ui()
         if not regex: return
         
@@ -2671,9 +2804,6 @@ class FindReplaceDialog(QDialog):
         cursor = editor.textCursor()
         
         # Search from current position
-        # find(QRegularExpression) is available in QTextDocument but we have compiled python regex
-        # Standard generic way: Get text, search using python regex, find first match AFTER cursor position.
-        
         text = editor.toPlainText()
         pos = cursor.position()
         
@@ -2681,94 +2811,193 @@ class FindReplaceDialog(QDialog):
         
         if not match:
             # Wrap around?
-            # Ask user or just wrap? Standard is wrap or stop.
-            # Let's clean wrap.
             match = regex.search(text, 0)
-            if not match:
-                self.status_label.setText("No matches found.")
-                return
-            else:
-                self.status_label.setText("Wrapped search.")
-        
-        # Select match
-        start, end = match.span()
-        new_cursor = editor.textCursor()
-        new_cursor.setPosition(start)
-        new_cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
-        editor.setTextCursor(new_cursor)
-        
-        # Ensure visible
-        editor.ensureCursorVisible() # Or custom helper
-        self.mainwindow.request_highlight_other(editor, start) # Optional Sync
-        
+            
+        if match:
+            start, end = match.span()
+            cursor.setPosition(start)
+            cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+            editor.setTextCursor(cursor)
+            editor.ensureCursorVisible()
+            self.status_label.setText(f"Found match at {start}-{end}")
+        else:
+            self.status_label.setText("No match found.")
+
     def on_replace(self):
-        # 1. Check if current selection matches 'Find' (or if we are on a match)
-        # 2. If yes, Replace.
-        # 3. Then Find Next.
-        
+        self.save_search_history()
+        # Get current selection
         editor = self.get_target_editor()
         cursor = editor.textCursor()
+        
         if not cursor.hasSelection():
             self.on_find_next()
             return
-            
-        selection = cursor.selectedText()
+
+        # Check if selection matches regex
+        text = editor.toPlainText()
+        sel_start = cursor.selectionStart()
+        sel_end = cursor.selectionEnd()
+        sel_text = cursor.selectedText()
         
-        # Verify selection matches criteria?
-        # Usually valid to replace whatever is selected if user clicked replace.
-        # But commonly we check if it matches pattern.
-        # For Translate mode: We translate whatever is selected?
+        regex = self._compile_regex_from_ui()
+        if not regex: return
+        
+        # Verify if current selection is a match
+        # match = regex.fullmatch(sel_text) # Might fail if regex expects context
+        # Better: search at position
+        match = regex.search(text, sel_start)
+        
+        if match and match.start() == sel_start and match.end() == sel_end:
+            # It is a match, replace it
+            repl_text = self.cb_replace.currentText()
+            new_text = ""
+            
+            # Resolve replacement
+            repl_mode = self.combo_repl_mode.currentText()
+            try:
+                if "Python Lambda" in repl_mode:
+                    user_lambda = eval(f"lambda match: {repl_text}")
+                    new_text = str(user_lambda(match))
+                elif "Regex Group" in repl_mode:
+                    new_text = match.expand(repl_text)
+                elif "Translate" in repl_mode:
+                     src = self.cb_src_chars.currentText()
+                     tgt = self.cb_replace.currentText()
+                     table = str.maketrans(src, tgt)
+                     new_text = match.group().translate(table)
+                elif not self.chk_regex.isChecked() and self.chk_extended.isChecked():
+                     new_text = repl_text.replace('\\n', '\n').replace('\\t', '\t')
+                else:
+                     new_text = repl_text
+            except Exception as e:
+                QMessageBox.critical(self, "Replace Error", str(e))
+                return
+
+            cursor.insertText(new_text)
+            self.status_label.setText("Replaced.")
+            
+            # Find next?
+            self.on_find_next()
+        else:
+            # Selection is not a match, just find next
+            self.on_find_next()
+
+    def on_replace_all_page(self):
+        self.save_search_history()
+        self._batch_replace([self.mainwindow.spin_page.text()], is_global=False)
+
+    def on_replace_all_global(self):
+        self.save_search_history()
+        # Confirm
+        ret = QMessageBox.warning(self, "Global Replace", 
+            "This will replace ALL occurrences in the PROEJCT. \nEnsure you have reviewed or are confident.\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if ret == QMessageBox.StandardButton.No: return
+        
+        pages = []
+        if self.rb_left.isChecked(): pages = list(self.mainwindow.pages_left.keys())
+        else: pages = list(self.mainwindow.pages_right_text.keys())
+        
+        self._batch_replace(pages, is_global=True)
+
+    def _batch_replace(self, page_nums, is_global=False):
+        regex = self._compile_regex_from_ui()
+        if not regex: return
         
         repl_mode = self.combo_repl_mode.currentText()
-        new_text = ""
+        repl_text = self.cb_replace.currentText()
         
-        if "Translate" in repl_mode:
-            src = self.cb_src_chars.currentText()
-            tgt = self.cb_replace.currentText()
-            try:
-                table = str.maketrans(src, tgt)
-                new_text = selection.translate(table)
-            except: 
-                new_text = selection # Fail safe
-        else:
-             # Standard Replace
-             # Need to use regex substitution on the selection if using groups?
-             # Or just simple replacement?
-             # If "Regex Group", we need the match object for the selection.
-             regex = self._compile_regex_from_ui()
-             if regex:
-                 # Check if selection matches regex
-                 m = regex.fullmatch(selection)
-                 if m:
-                     if "Python Lambda" in repl_mode:
-                          try:
-                              repl_t = self.cb_replace.currentText()
-                              user_l = eval(f"lambda match: {repl_t}")
-                              new_text = str(user_l(m))
-                          except: new_text = selection
-                     elif "Regex Group" in repl_mode:
-                          new_text = m.expand(self.cb_replace.currentText())
-                     else:
-                          # Normal / Extended
-                          r_txt = self.cb_replace.currentText()
-                          if not self.chk_regex.isChecked() and self.chk_extended.isChecked():
-                               r_txt = r_txt.replace('\\n', '\n').replace('\\t', '\t')
-                          new_text = r_txt
-                 else:
-                     # Selection doesn't match pattern. Replace anyway?
-                     # Standard behavior: Only replace if matches.
-                     self.status_label.setText("Selection matches pattern? No. Finding next.")
-                     self.on_find_next()
-                     return
-             else:
-                 new_text = self.cb_replace.currentText()
+        # Prepare Repl Func
+        import html
+        repl_func = None
 
-        # Execute Replace
-        cursor.insertText(new_text)
-        self.status_label.setText("Replaced.")
+        if "Python Lambda" in repl_mode:
+            try:
+                user_lambda = eval(f"lambda match: {repl_text}")
+                repl_func = lambda m: str(user_lambda(m))
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Lambda Error: {e}")
+                return
+        elif "Regex Group" in repl_mode:
+            repl_func = lambda m: m.expand(repl_text)
+        elif "Translate" in repl_mode:
+             src = self.cb_src_chars.currentText()
+             tgt = self.cb_replace.currentText()
+             try:
+                 table = str.maketrans(src, tgt)
+                 repl_func = lambda m: m.group().translate(table)
+             except Exception as e:
+                  QMessageBox.critical(self, "Error", f"Translate Error: {e}")
+                  return
+        elif not self.chk_regex.isChecked() and self.chk_extended.isChecked():
+             r_txt = repl_text.replace('\\n', '\n').replace('\\t', '\t')
+             repl_func = lambda m: r_txt
+        else:
+             repl_func = lambda m: repl_text
+             
+        # Undo Snapshot
+        if is_global:
+            self.mainwindow.push_global_undo("Replace All Global")
+        elif not is_global and len(page_nums) == 1:
+             # Page level undo handled by editor usually? 
+             # But we are modifying data dict directly or editor?
+             self.mainwindow.save_current_page_data()
         
-        # Find Next
-        self.on_find_next()
+        count = 0
+        target_dict = self.mainwindow.pages_left if self.rb_left.isChecked() else self.mainwindow.pages_right_text
+        
+        for p_key in page_nums:
+            try: p_num = int(p_key)
+            except: continue
+            
+            # Load text
+            if not is_global and str(p_num) == self.mainwindow.spin_page.text():
+                 # Use editor text for current page
+                 txt = self.get_target_editor().toPlainText()
+            else:
+                 txt = target_dict.get(p_num, "")
+            
+            # Apply Replace
+            try:
+                new_txt, n = regex.subn(repl_func, txt)
+                if n > 0:
+                    target_dict[p_num] = new_txt
+                    self.mainwindow.mark_page_dirty(p_num, self.rb_left.isChecked())
+                    count += n
+            except Exception as e:
+                print(f"Error replacing on page {p_num}: {e}")
+                
+        # Reload UI
+        if is_global or (len(page_nums) > 0 and str(page_nums[0]) == self.mainwindow.spin_page.text()):
+             self.mainwindow.force_ui_reload()
+
+        self.status_label.setText(f"Replaced {count} occurrences.")
+
+    def on_count_page(self):
+        self._count_matches(is_global=False)
+
+    def on_count_global(self):
+        self._count_matches(is_global=True)
+
+    def _count_matches(self, is_global):
+        regex = self._compile_regex_from_ui()
+        if not regex: return
+        
+        count = 0
+        scope_str = "Current Page" if not is_global else "Global Project"
+        
+        if is_global:
+            target_dict = self.mainwindow.pages_left if self.rb_left.isChecked() else self.mainwindow.pages_right_text
+            for txt in target_dict.values():
+                try: count += len(list(regex.finditer(txt)))
+                except: pass
+        else:
+            editor = self.get_target_editor()
+            text = editor.toPlainText()
+            try: count = len(list(regex.finditer(text)))
+            except: count = 0
+            
+        self.status_label.setText(f"Count ({scope_str}): {count} matches.")
         
     def init_tab_batch(self):
         layout = QVBoxLayout(self.tab_batch)
@@ -2777,23 +3006,40 @@ class FindReplaceDialog(QDialog):
         h = QHBoxLayout()
         h.addWidget(QLabel("Template:"))
         self.combo_template = QComboBox()
+        
         h.addWidget(self.combo_template, 1)
         layout.addLayout(h)
         
-        # Manage
-        btn_manage = QPushButton("Manage Templates...")
-        btn_manage.clicked.connect(self.on_manage_templates)
-        layout.addWidget(btn_manage)
+        # Tools
+        bg_tools = QGroupBox("Template Management")
+        l_tools = QHBoxLayout(bg_tools)
+        
+        btn_new = QPushButton("New")
+        btn_new.clicked.connect(self.on_template_new)
+        btn_edit = QPushButton("Edit")
+        btn_edit.clicked.connect(self.on_template_edit)
+        btn_del = QPushButton("Delete")
+        btn_del.clicked.connect(self.on_template_delete)
+        
+        l_tools.addWidget(btn_new)
+        l_tools.addWidget(btn_edit)
+        l_tools.addWidget(btn_del)
+        layout.addWidget(bg_tools)
         
         # Actions
+        bg_run = QGroupBox("Execution")
+        l_run = QVBoxLayout(bg_run)
+        
         btn_run_page = QPushButton("Run Batch (Current Page)")
         btn_run_page.clicked.connect(self.on_batch_run_page)
         btn_run_global = QPushButton("Run Batch (All Pages)")
         btn_run_global.clicked.connect(self.on_batch_run_global)
         
+        l_run.addWidget(btn_run_page)
+        l_run.addWidget(btn_run_global)
+        layout.addWidget(bg_run)
+        
         layout.addStretch()
-        layout.addWidget(btn_run_page)
-        layout.addWidget(btn_run_global)
 
     def init_tab_diff(self):
         """Diff Filter UI"""
@@ -2851,11 +3097,35 @@ class FindReplaceDialog(QDialog):
         self.combo_template.addItems(names)
         if curr in names:
             self.combo_template.setCurrentText(curr)
+        elif names:
+             self.combo_template.setCurrentIndex(0)
 
-    def on_manage_templates(self):
+    def on_template_new(self):
+        dlg = TemplateEditorDialog(self, self.template_manager, None)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.refresh_combo_templates()
+            # Select new
+            # If name is known? TemplateEditorDialog saves it.
+            # We can select it by name if we knew it, but refresh handles it.
+            
+    def on_template_edit(self):
         curr = self.combo_template.currentText()
+        if not curr: return
         dlg = TemplateEditorDialog(self, self.template_manager, curr)
         if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.refresh_combo_templates()
+            self.combo_template.setCurrentText(curr) # Try maintain selection
+            
+    def on_template_delete(self):
+        curr = self.combo_template.currentText()
+        if not curr: return
+        
+        ret = QMessageBox.warning(self, "Delete Template", 
+            f"Are you sure you want to delete template '{curr}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            
+        if ret == QMessageBox.StandardButton.Yes:
+            self.template_manager.delete_template(curr)
             self.refresh_combo_templates()
             
     def on_batch_run_page(self):
@@ -3018,9 +3288,11 @@ class FindReplaceDialog(QDialog):
         self.status_label.setText(f"Batch completed. {count_total} replacements.")
 
     def on_replace_all_page(self):
+        self.save_search_history()
         self._batch_replace([self.mainwindow.spin_page.text()], is_global=False)
 
     def on_replace_all_global(self):
+        self.save_search_history()
         # Confirm
         ret = QMessageBox.warning(self, "Global Replace", 
             "This will replace text in ALL pages. You can undo this action later, but manual edits might be lost if you undo.\nContinue?",
@@ -3147,15 +3419,61 @@ class FindReplaceDialog(QDialog):
     def on_count(self):
         regex = self._compile_regex_from_ui()
         if not regex: return
+        
+        # Current Page Count
         editor = self.get_target_editor()
-        text = editor.toPlainText()
+        text_page = editor.toPlainText()
         try:
-            count = len(list(regex.finditer(text)))
-            self.status_label.setText(f"Count: {count} matches.")
-        except Exception as e:
-            self.status_label.setText(f"Error: {e}")
+            count_page = len(list(regex.finditer(text_page)))
+        except: count_page = 0
+            
+        # Global Count
+        count_global = 0
+        target_dict = self.mainwindow.pages_left if self.rb_left.isChecked() else self.mainwindow.pages_right_text
+        for txt in target_dict.values():
+            try:
+                count_global += len(list(regex.finditer(txt)))
+            except: pass
+            
+        self.status_label.setText(f"Matches: {count_page} (Current Page) / {count_global} (Global Project)")
 
-    def on_review(self, is_global=False):
+    def on_find_all_page(self):
+        self.on_review(is_global=False, find_only=True)
+        
+    def on_find_all_global(self):
+        self.on_review(is_global=True, find_only=True)
+
+    def select_all_review(self):
+        if not self.review_table.model(): return
+        for i in range(self.review_table.model().rowCount()):
+            self.review_table.model()._data[i]['checked'] = True
+        self.review_table.model().layoutChanged.emit() # Refresh all
+        
+    def deselect_all_review(self):
+        if not self.review_table.model(): return
+        for i in range(self.review_table.model().rowCount()):
+            self.review_table.model()._data[i]['checked'] = False
+        self.review_table.model().layoutChanged.emit()
+
+    def toggle_review_selection(self):
+        rows = sorted(set(index.row() for index in self.review_table.selectedIndexes()))
+        if not rows or not self.review_table.model(): return
+        
+        # Toggle based on first selected item? Or flip each?
+        # User said "Select items then check/uncheck".
+        # If mixed, maybe set all to Checked? Or Unchecked?
+        # Standard: Flip each.
+        
+        m = self.review_table.model()
+        for r in rows:
+            m._data[r]['checked'] = not m._data[r]['checked']
+            
+        # Optimize emit?
+        # model.dataChanged for specific rows?
+        # LayoutChanged is easiest for now.
+        m.layoutChanged.emit()
+
+    def on_review(self, is_global=False, find_only=False):
         # 1. Clear previous
         self.current_review_items = []
         self.review_is_global = is_global
@@ -3170,7 +3488,6 @@ class FindReplaceDialog(QDialog):
         else:
             pages = [self.mainwindow.spin_page.text()]
             
-        font = self.mainwindow.font()
         self.status_label.setText("Generating review...")
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         
@@ -3187,26 +3504,128 @@ class FindReplaceDialog(QDialog):
                 else:
                      text = target_dict.get(p_num, "")
                 
-                self._generate_review_items_for_page(p_num, text, regex)
+                self._generate_review_items_for_page(p_num, text, regex, is_find_only=find_only)
                 
             # Set Model
             self.model = ReviewTableModel(self.current_review_items)
             self.review_table.setModel(self.model)
+            # Resize
             self.review_table.resizeColumnsToContents()
+            self.review_table.resizeRowsToContents()
             self.review_table.horizontalHeader().setStretchLastSection(True)
+            # Set Col 0 width fix
+            self.review_table.setColumnWidth(0, 30)
+            self.review_table.setColumnWidth(4, 400) # Give more space to context
                 
         finally:
             QApplication.restoreOverrideCursor()
             
         if not self.current_review_items:
-            self.status_label.setText("No matches found for review.")
+            self.status_label.setText("No matches found.")
             return
 
         # 3. Show Review UI
         self.tabs.setVisible(False)
         self.scope_group.setVisible(False)
         self.review_group.setVisible(True)
-        self.status_label.setText(f"Found {len(self.current_review_items)} changes.")
+        self.status_label.setText(f"Found {len(self.current_review_items)} {'matches' if find_only else 'replacements'}.")
+        
+        # Adjust UI for Find vs Replace
+        if find_only:
+            self.review_table.setColumnHidden(0, True) # Hide Checkboxes
+            self.review_top_widget.setVisible(False)   # Hide Top Selection Buttons
+            self.btn_rev_apply.setVisible(False)       # Hide Apply Button
+            self.btn_rev_cancel.setText("Back")        # Change Cancel to Back
+        else:
+            self.review_table.setColumnHidden(0, False)
+            self.review_top_widget.setVisible(True)
+            self.btn_rev_apply.setVisible(True)
+            self.btn_rev_cancel.setText("Cancel Review")
+
+    def _generate_review_items_for_page(self, page_num, text, regex, is_find_only=False):
+        import html
+        
+        repl_func = None
+        if not is_find_only:
+            repl_mode = self.combo_repl_mode.currentText()
+            repl_text = self.cb_replace.currentText()
+
+            if "Python Lambda" in repl_mode:
+                try:
+                    user_lambda = eval(f"lambda match: {repl_text}")
+                    repl_func = lambda m: str(user_lambda(m))
+                except: return
+            elif "Regex Group" in repl_mode:
+                repl_func = lambda m: m.expand(repl_text)
+            elif "Translate" in repl_mode:
+                 src = self.cb_src_chars.currentText()
+                 tgt = self.cb_replace.currentText()
+                 try:
+                     table = str.maketrans(src, tgt)
+                     repl_func = lambda m: m.group().translate(table)
+                 except: return
+            elif not self.chk_regex.isChecked() and self.chk_extended.isChecked():
+                 r_txt = repl_text.replace('\\n', '\n').replace('\\t', '\t')
+                 repl_func = lambda m: r_txt
+            else:
+                 repl_func = lambda m: repl_text
+        
+        matches = list(regex.finditer(text))
+        
+        for m in matches:
+            original = m.group()
+            start, end = m.span()
+            
+            # Line/Col Calculation
+            line = text.count('\n', 0, start) + 1
+            last_nl = text.rfind('\n', 0, start)
+            if last_nl == -1: col = start + 1
+            else: col = start - last_nl
+            
+            new_t = original
+            item_checked = True
+            
+            if not is_find_only and repl_func:
+                try:
+                    new_t = repl_func(m)
+                except: new_t = "ERROR"
+                
+                # If no change, skip in replace mode
+                if original == new_t: continue
+            else:
+                # Find Only mode: uncheck by default if we want? 
+                # Or check to allow "Select and Delete"? No, Find All shouldn't delete.
+                # Just check so user sees them highlighted.
+                item_checked = False
+            
+            # Context HTML
+            c_start = max(0, start - 20)
+            c_end = min(len(text), end + 20)
+            
+            prefix = html.escape(text[c_start:start])
+            suffix = html.escape(text[end:c_end])
+            orig_esc = html.escape(original)
+            
+            diff_html = ""
+            if is_find_only:
+                # Highlight only
+                diff_html = f"{prefix}<span style='background-color:#ffff00; color:black;'><b>{orig_esc}</b></span>{suffix}"
+            else:
+                # Diff style
+                new_esc = html.escape(new_t)
+                diff_html = f"{prefix}<span style='background-color:#ffcccc; text-decoration:line-through;'>{orig_esc}</span> <span style='background-color:#ccffcc;'><b>{new_esc}</b></span>{suffix}"
+            
+            item_data = {
+                'page_num': page_num,
+                'line': line,
+                'col': col,
+                'span': (start, end), 
+                'original': original,
+                'new': new_t,
+                'context_html': diff_html,
+                'checked': item_checked
+            }
+            self.current_review_items.append(item_data)
         
     def close_review(self):
         self.review_group.setVisible(False)
@@ -3300,63 +3719,7 @@ class FindReplaceDialog(QDialog):
                 return re.compile(re.escape(s_pat), flags)
         except: return None
 
-    def _generate_review_items_for_page(self, page_num, text, regex):
-        repl_mode = self.combo_repl_mode.currentText()
-        repl_text = self.cb_replace.currentText()
-        repl_func = None
 
-        if "Python Lambda" in repl_mode:
-            try:
-                user_lambda = eval(f"lambda match: {repl_text}")
-                repl_func = lambda m: str(user_lambda(m))
-            except: return
-        elif "Regex Group" in repl_mode:
-            repl_func = lambda m: m.expand(repl_text)
-        elif "Translate" in repl_mode:
-             src = self.cb_src_chars.currentText()
-             tgt = self.cb_replace.currentText()
-             try:
-                 table = str.maketrans(src, tgt)
-                 repl_func = lambda m: m.group().translate(table)
-             except: return
-        elif not self.chk_regex.isChecked() and self.chk_extended.isChecked():
-             r_txt = repl_text.replace('\\n', '\n').replace('\\t', '\t')
-             repl_func = lambda m: r_txt
-        else:
-             repl_func = lambda m: repl_text
-
-        matches = list(regex.finditer(text))
-        import html
-        
-        for m in matches:
-            original = m.group()
-            try:
-                new_t = repl_func(m)
-            except: new_t = "ERROR"
-            
-            if original == new_t: continue
-            
-            start, end = m.span()
-            c_start = max(0, start - 15)
-            c_end = min(len(text), end + 15)
-            
-            prefix = html.escape(text[c_start:start])
-            suffix = html.escape(text[end:c_end])
-            orig_esc = html.escape(original)
-            new_esc = html.escape(new_t)
-            
-            diff_html = f"{prefix}<span style='background-color:#ffcccc; text-decoration:line-through;'>{orig_esc}</span> <span style='background-color:#ccffcc;'>{new_esc}</span>{suffix}"
-            
-            item_data = {
-                'page_num': page_num,
-                'span': (start, end), 
-                'original': original,
-                'new': new_t,
-                'context_html': diff_html,
-                'checked': True
-            }
-            # Add directly to list, Model is set afterwards
-            self.current_review_items.append(item_data)
 
     def on_review_diff(self, is_global):
         """Handler for Diff Filter Review"""
@@ -3456,16 +3819,42 @@ class FindReplaceDialog(QDialog):
 
 
     def on_review_table_dbl_click(self, index):
-        """Double click to jump to page"""
+        """Double click to jump to page and exact location"""
         if not index.isValid(): return
         
         row = index.row()
         if 0 <= row < len(self.current_review_items):
             item = self.current_review_items[row]
             page_num = item.get('page_num')
+            span = item.get('span')
+            
             if page_num:
-                self.mainwindow.spin_page.setText(str(page_num))
-                self.mainwindow.jump_page()
+                # 1. Switch Page
+                if str(page_num) != self.mainwindow.spin_page.text():
+                    self.mainwindow.spin_page.setText(str(page_num))
+                    # Force load NOW to ensure editor has text
+                    self.mainwindow.jump_page()
+                    # Process events to allow UI update? 
+                    QApplication.processEvents()
+            
+            # 2. Scroll to Span
+            if span:
+                editor = self.get_target_editor()
+                if not editor: return
+                
+                # Verify length matching (safety)
+                # Text should be loaded by jump_page
+                
+                cursor = editor.textCursor()
+                start, end = span
+                
+                try:
+                    cursor.setPosition(start)
+                    cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+                    editor.setTextCursor(cursor)
+                    editor.ensureCursorVisible()
+                    editor.setFocus()
+                except: pass # In case text changed or index OOB
 
     def reset_review_ui(self):
         """Reset the review UI to initial search state"""
@@ -3928,8 +4317,8 @@ class MainWindow(QMainWindow):
     def reload_all_data(self):
         # Prevent auto-save of old content into new data
         self.current_loaded_page = None
-        
-        # 1. 加载文本
+        self.last_loaded_source = "Text File B" # Track source for saving
+        self.current_ocr_data = None      # 1. 加载文本
         self.pages_left = read_text_to_pages(self.project_config['text_path_left'])
         self.pages_right_text = read_text_to_pages(self.project_config['text_path_right'])
         
@@ -4065,6 +4454,10 @@ class MainWindow(QMainWindow):
             # Force run immediately for first load? Or use deferred?
             # Use deferred to keep it async
             self.deferred_run_diff()
+            
+            # Record last loaded source
+            self.last_loaded_source = "OCR Results" if is_ocr_mode else "Text File B"
+
         finally:
             self._is_loading = False
 
@@ -4425,13 +4818,22 @@ class MainWindow(QMainWindow):
             self.pages_left[p] = current_left
             self.mark_page_dirty(p, True)
             
-        # Right (Only if Text File B source)
-        if self.combo_source.currentText() == "Text File B":
+        # Right (Check Last Loaded Source!)
+        if hasattr(self, 'last_loaded_source') and self.last_loaded_source == "Text File B":
             current_right = self.edit_right.toPlainText()
             saved_right = self.pages_right_text.get(p, "")
             if current_right != saved_right:
                  self.pages_right_text[p] = current_right
                  self.mark_page_dirty(p, False)
+        elif not hasattr(self, 'last_loaded_source'):
+            # Fallback for initialization or if variable missing
+             if self.combo_source.currentText() == "Text File B": # This was the buggy line if switching!
+                 # But if we are here, we might be switching.
+                 # Safe default: Do NOT save if we are unsure? 
+                 # Or save if combo says Text File B? 
+                 # The bug was relying on combo text during switch.
+                 # If we don't have last_loaded_source, we skip saving right to be safe?
+                 pass 
 
     def on_scroll(self, source, target):
         """Percentage-based scroll sync"""
@@ -4526,17 +4928,6 @@ class MainWindow(QMainWindow):
                     # standardize bbox to x,y,w,h
                     x, y, w, h = 0,0,0,0
                     if len(bbox) == 4:
-                         # 假设是 x1,y1,x2,y2 (LayoutParser) 
-                         # 或者 x,y,w,h (Paddle Dict)?
-                         # 需要根据 load_ocr_json 的实际输出来定。
-                         # 查看 load_ocr_json:
-                         #   Paddle Dict: 'bbox': [x1, y1, x2, y2]
-                         #   Paddle List: calculated [minx, miny, maxx, maxy]
-                         # So it is consistently [x1, y1, x2, y2] in my code logic above (lines 535-544 modify it logic? Wait)
-                         # line 535 logic: `bbox = [min(xs), min(ys), max(xs), max(ys)]` which is [x1, y1, x2, y2]
-                         # line 532 logic: `bbox = item.get('bbox', [])`. standard layout parser is [x,y,w,h]? No usually [x1,y1,x2,y2]. 
-                         # Let's assume [x1, y1, x2, y2]
-                         
                          x, y = bbox[0], bbox[1]
                          w, h = bbox[2]-bbox[0], bbox[3]-bbox[1]
                          
@@ -4675,10 +5066,6 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Info", "No missing OCR pages found.")
             return
             
-        # ret = QMessageBox.question(self, "Batch OCR", f"Found {len(missing_pages)} missing pages. Start?", 
-        #                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        # if ret == QMessageBox.StandardButton.Yes:
-        
         # Direct Start with Cancel Option
         self.btn_batch.setText("Cancel OCR")
         self.progress_bar.setVisible(True)
@@ -4824,7 +5211,7 @@ class MainWindow(QMainWindow):
                  t = self._extract_text_from_ocr_data(data)
                  full_text += f"<{p}>\n{t}\n"
                  
-        filename, _ = QFileDialog.getSaveFileName(self, "Export All OCR", "all_ocr.txt", "Text Files (*.txt)")
+        filename, _ = QFileDialog.getSaveFileName(self, "Export All OCR", f"{self.project_config.get('project_name','all')}_ocr.txt", "Text Files (*.txt)")
         if filename:
             with open(filename, 'w', encoding='utf-8') as f:
                 f.write(full_text)

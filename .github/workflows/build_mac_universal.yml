@@ -7,10 +7,8 @@ on:
 
 jobs:
   build-mac:
-    # نستخدم macos-13 تحديداً لأنه يعمل بمعالج Intel
-    # هذا يضمن أن التطبيق سيعمل على أجهزة إنتل القديمة
-    # وسيعمل أيضاً على أجهزة M1/M2/M3 الجديدة عبر (Rosetta 2)
-    runs-on: macos-13
+    # التغيير هنا: نستخدم macos-12 لضمان توفر معالج Intel
+    runs-on: macos-12
 
     steps:
     - uses: actions/checkout@v4
@@ -23,26 +21,27 @@ jobs:
     - name: Install Dependencies
       run: |
         python -m pip install --upgrade pip
-        # تثبيت المكتبات الخاصة بكودك
+        # تثبيت المكتبات (PyQt6 و PyMuPDF)
         pip install PyQt6 pymupdf requests pyinstaller
 
     - name: Build .app with PyInstaller
-      # نستخدم --windowed لإنشاء تطبيق ماك (.app)
-      # نستخدم --noconsole لإخفاء الشاشة السوداء
+      # بناء التطبيق بصيغة .app
       run: |
         pyinstaller --name "OCR-Proofreader" --windowed --noconsole --clean ocr_proofreading.py
 
     - name: Create DMG Installer
-      # نستخدم أداة hdiutil المدمجة في الماك لإنشاء ملف التثبيت
+      # إنشاء ملف التثبيت DMG مع أيقونة التطبيقات
       run: |
-        # إنشاء مجلد مؤقت لوضع التطبيق فيه
+        # إنشاء مجلد مؤقت
         mkdir -p dist/dmg_content
+        
+        # نسخ التطبيق إلى المجلد المؤقت
         cp -r "dist/OCR-Proofreader.app" dist/dmg_content/
         
-        # إنشاء رابط لمجلد التطبيقات (Applications) ليسهل على المستخدم النقل
+        # إنشاء اختصار لمجلد التطبيقات (مهم جداً لتجربة المستخدم)
         ln -s /Applications dist/dmg_content/Applications
         
-        # إنشاء ملف الـ DMG
+        # ضغط الكل في ملف DMG
         hdiutil create -volname "OCR-Proofreader-Installer" -srcfolder dist/dmg_content -ov -format UDZO "dist/OCR-Proofreader.dmg"
 
     - name: Upload DMG Artifact

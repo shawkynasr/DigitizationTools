@@ -1,0 +1,45 @@
+name: Build OCR Proofreader EXE
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    # 1. تحميل الكود
+    - uses: actions/checkout@v4
+
+    # 2. إعداد بايثون
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    # 3. تثبيت المكتبات (معدلة لتناسب ocr_proofreading.py)
+    # لاحظ: هذا الملف يستخدم PyQt6 وليس PySide6
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install PyQt6 pymupdf requests pyinstaller
+
+    # 4. بناء ملف EXE
+    # نستخدم --onefile لدمج كل شيء في ملف واحد
+    # نستخدم --windowed لإخفاء الشاشة السوداء (Console)
+    - name: Build with PyInstaller
+      run: |
+        pyinstaller --name "OCR-Proofreader" --onefile --windowed --clean ocr_proofreading.py
+
+    # 5. عرض محتويات المجلد (للتأكد في حالة الأخطاء)
+    - name: List dist directory
+      run: dir dist
+
+    # 6. رفع الملف النهائي للتحميل
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: OCR-Proofreader-Windows
+        path: dist/*.exe

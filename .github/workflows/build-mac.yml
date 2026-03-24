@@ -1,0 +1,77 @@
+name: Build Optimized macOS DMG
+
+# This triggers the action whenever you push to the main branch
+# or you can click "Run workflow" manually from the Actions tab.
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-mac:
+    name: Build macOS Application
+    runs-on: macos-latest
+
+    steps:
+    - name: 📥 Checkout repository
+      uses: actions/checkout@v4
+
+    - name: 🐍 Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12' # You can adjust this to your preferred version
+
+    - name: 📦 Install strictly required dependencies
+      run: |
+        python -m pip install --upgrade pip
+        
+        # Install PyInstaller
+        pip install pyinstaller
+        
+        # IMPORTANT: Install ONLY what your app actually imports!
+        # If you use a requirements.txt, make sure it doesn't contain bloat.
+        # Example for your PySide6 app:
+        pip install PySide6
+        
+        # Add any other specific libraries ocr_proofreading.py needs here:
+        # pip install opencv-python-headless numpy pandas
+
+    - name: 🏗️ Build App with PyInstaller (Diet Mode)
+      run: |
+        # We exclude WebEngine, Qml, Quick, and others to save ~150MB+
+        pyinstaller --name "OCR_Proofreader" \
+          --windowed \
+          --noconsole \
+          --clean \
+          --exclude-module PySide6.QtWebEngine \
+          --exclude-module PySide6.QtWebEngineCore \
+          --exclude-module PySide6.QtNetwork \
+          --exclude-module PySide6.QtQml \
+          --exclude-module PySide6.QtQuick \
+          --exclude-module PySide6.QtSensors \
+          --exclude-module PySide6.QtMultimedia \
+          --exclude-module PySide6.QtSql \
+          --exclude-module matplotlib \
+          --exclude-module tkinter \
+          ocr_proofreading.py
+
+    - name: 💽 Package into .dmg installer
+      run: |
+        # 1. Create a temporary staging folder
+        mkdir -p dmg_staging
+        
+        # 2. Copy the lean .app from the dist folder into staging
+        cp -r dist/OCR_Proofreader.app dmg_staging/
+        
+        # 3. Create a symbolic link to the Mac Applications folder
+        ln -s /Applications dmg_staging/Applications
+        
+        # 4. Use Apple's built-in tool to compress it into a DMG
+        hdiutil create -volname "OCR_Proofreader" -srcfolder dmg_staging -ov -format UDZO OCR_Proofreader.dmg
+
+    - name: 📤 Upload final DMG Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: OCR-Proofreader-Mac
+        path: OCR_Proofreader.dmg
+        retention-days: 7

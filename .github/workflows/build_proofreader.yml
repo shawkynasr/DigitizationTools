@@ -1,45 +1,135 @@
-name: Build OCR Proofreader EXE
+name: Build OCR Proofreader & Auto Release
 
-on:
-  push:
-    branches: [ "main", "master" ]
+on: 
+  push: 
+    branches: [ "main", "master" ] 
   workflow_dispatch:
 
 jobs:
-  build:
+  # ==========================================
+  # 1. WINDOWS BUILD (.exe)
+  # ==========================================
+  build-windows:
+    name: Build Windows
     runs-on: windows-latest
-
     steps:
-    # 1. تحميل الكود
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PyQt6 pymupdf requests pyinstaller
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --name "OCR-Proofreader-Win" --onefile --windowed --clean ocr_proofreading.py
+      - name: Upload Windows Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OCR-Proofreader-Windows
+          path: dist/*.exe
 
-    # 2. إعداد بايثون
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
+  # ==========================================
+  # 2. MAC INTEL BUILD (.dmg)
+  # ==========================================
+  build-mac-intel:
+    name: Build macOS (Intel)
+    runs-on: macos-13  # GitHub's dedicated Intel runner
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PyQt6 pymupdf requests pyinstaller
+      - name: Build App (Standard Mode)
+        run: |
+          pyinstaller --name "OCR-Proofreader-Intel" \
+            --windowed \
+            --noconsole \
+            --clean \
+            ocr_proofreading.py
+      - name: Package into DMG
+        run: |
+          mkdir -p dmg_staging
+          cp -r dist/OCR-Proofreader-Intel.app dmg_staging/
+          ln -s /Applications dmg_staging/Applications
+          hdiutil create -volname "OCR_Proofreader_Intel" -srcfolder dmg_staging -ov -format UDZO OCR-Proofreader-Intel.dmg
+      - name: Upload Intel Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OCR-Proofreader-Mac-Intel
+          path: OCR-Proofreader-Intel.dmg
 
-    # 3. تثبيت المكتبات (معدلة لتناسب ocr_proofreading.py)
-    # لاحظ: هذا الملف يستخدم PyQt6 وليس PySide6
-    - name: Install Dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install PyQt6 pymupdf requests pyinstaller
+  # ==========================================
+  # 3. MAC APPLE SILICON BUILD (.dmg)
+  # ==========================================
+  build-mac-silicon:
+    name: Build macOS (Apple Silicon M-Series)
+    runs-on: macos-14  # GitHub's dedicated Apple Silicon runner
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PyQt6 pymupdf requests pyinstaller
+      - name: Build App (Standard Mode)
+        run: |
+          pyinstaller --name "OCR-Proofreader-Silicon" \
+            --windowed \
+            --noconsole \
+            --clean \
+            --target-architecture arm64 \
+            ocr_proofreading.py
+      - name: Package into DMG
+        run: |
+          mkdir -p dmg_staging
+          cp -r dist/OCR-Proofreader-Silicon.app dmg_staging/
+          ln -s /Applications dmg_staging/Applications
+          hdiutil create -volname "OCR_Proofreader_Silicon" -srcfolder dmg_staging -ov -format UDZO OCR-Proofreader-Silicon.dmg
+      - name: Upload Silicon Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OCR-Proofreader-Mac-Silicon
+          path: OCR-Proofreader-Silicon.dmg
 
-    # 4. بناء ملف EXE
-    # نستخدم --onefile لدمج كل شيء في ملف واحد
-    # نستخدم --windowed لإخفاء الشاشة السوداء (Console)
-    - name: Build with PyInstaller
-      run: |
-        pyinstaller --name "OCR-Proofreader" --onefile --windowed --clean ocr_proofreading.py
+  # ==========================================
+  # 4. AUTO-RELEASE & GENERATE NOTES
+  # ==========================================
+  release:
+    name: Create GitHub Release
+    needs: [build-windows, build-mac-intel, build-mac-silicon]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all compiled artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-files
 
-    # 5. عرض محتويات المجلد (للتأكد في حالة الأخطاء)
-    - name: List dist directory
-      run: dir dist
+      - name: Generate Dynamic Version Tag
+        id: tag
+        run: echo "TAG_NAME=v1.0.${{ github.run_number }}" >> $GITHUB_ENV
 
-    # 6. رفع الملف النهائي للتحميل
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: OCR-Proofreader-Windows
-        path: dist/*.exe
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          name: "OCR Proofreader ${{ env.TAG_NAME }}"
+          generate_release_notes: true
+          files: |
+            dist-files/OCR-Proofreader-Windows/*.exe
+            dist-files/OCR-Proofreader-Mac-Intel/*.dmg
+            dist-files/OCR-Proofreader-Mac-Silicon/*.dmg
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -18,9 +18,11 @@ import bisect
 
 from tools.pdf_tools import SplitPdfDialog, ExportPdfImageDialog
 from tools.text_tools import MergeTextDialog, read_text_to_pages, write_pages_to_file, PAGE_PATTERN
-from tools.furigana import generate_furigana_string, HAS_KAKASI
+from tools.furigana import generate_furigana_string, HAS_FURIGANA, HAS_KAKASI
 from tools.project_manager_ui import ProjectManagerDialog
 from tools.export_manager import ExportManager
+from tools.similarity_tools import SimilarityDialog, calculate_page_similarities, text_similarity
+from tools.headword_compare_tools import HeadwordCompareDialog
 
 from find_replace import FindReplaceDialog
 
@@ -50,8 +52,10 @@ def to_py_pos(full_text: str, qt_pos: int) -> int:
 # ==========================================
 
 DEFAULT_GLOBAL_CONFIG = {
-    "ocr_api_url": "",
     "ocr_api_token": "",
+    "ocr_api_model": "PaddleOCR-VL-1.6",
+    "ocr_retry_count": 3,
+    "ocr_concurrent_tasks": 2,
     "ocr_engine": "remote",  # remote or local
     "find_history": [],
     "replace_history": [],
@@ -82,7 +86,7 @@ DEFAULT_PROJECT_CONFIG = {
 # ==========================================
 
 from ocr.ocr_utils import get_page_image, TextToBBoxMapper, BBoxMerger, ImageStitcher
-from ocr.ocr_worker import OCRWorker, ImageExportWorker, get_available_engines
+from ocr.ocr_worker import OCRWorker, ImageExportWorker, get_available_engines, refresh_remote_engine_label, V2_MODELS
 
 
 # ==========================================
@@ -1009,6 +1013,9 @@ class MainWindow(QMainWindow):
         self.project_config = self.config_manager.get_active_project()
         self.exporter = ExportManager(self)
         
+        # Sync engine label with saved model name
+        refresh_remote_engine_label(self.global_config.get("ocr_api_model", "PaddleOCR-VL-1.6"))
+        
         self.last_active_editor = None
         self._is_navigating_from_image = False
         self._is_loading = False
@@ -1125,6 +1132,8 @@ class MainWindow(QMainWindow):
         self.act_split.setText(self.get_text("act_split"))
         self.act_exp_img.setText(self.get_text("act_exp_img"))
         self.act_merge.setText(self.get_text("act_merge"))
+        self.act_similarity.setText("相似度窗口")
+        self.act_headword_compare.setText("词头对比窗口")
         
         self.act_exp_slice.setText(self.get_text("act_exp_slice"))
         self.act_exp_ocr_curr.setText(self.get_text("act_exp_ocr_curr"))
@@ -1173,7 +1182,7 @@ class MainWindow(QMainWindow):
             editor.setTextCursor(cursor)
             
     def apply_furigana_to_selection(self):
-        if not HAS_KAKASI: return
+        if not HAS_FURIGANA: return
         
         editor = self._get_focused_editor()
         if not editor: return
@@ -1202,6 +1211,41 @@ class MainWindow(QMainWindow):
     def show_merge_text_dialog(self):
         d = MergeTextDialog(self)
         d.exec()
+
+    def show_similarity_dialog(self):
+        if not hasattr(self, "similarity_dialog") or self.similarity_dialog is None:
+            self.similarity_dialog = SimilarityDialog(self)
+            self.similarity_dialog.destroyed.connect(lambda: setattr(self, "similarity_dialog", None))
+        self.similarity_dialog.show()
+        self.similarity_dialog.raise_()
+        self.similarity_dialog.activateWindow()
+
+    def show_headword_compare_dialog(self):
+        if not hasattr(self, "headword_compare_dialog") or self.headword_compare_dialog is None:
+            self.headword_compare_dialog = HeadwordCompareDialog(self)
+            self.headword_compare_dialog.destroyed.connect(lambda: setattr(self, "headword_compare_dialog", None))
+        self.headword_compare_dialog.show()
+        self.headword_compare_dialog.raise_()
+        self.headword_compare_dialog.activateWindow()
+
+    def calculate_page_similarities(self):
+        return calculate_page_similarities(self.pages_left, self.pages_right_text)
+
+    def start_background_progress(self, label):
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setValue(0)
+        self.statusBar().showMessage(f"{label}: 准备计算...")
+
+    def update_background_progress(self, done, total, message):
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, max(total, 1))
+        self.progress_bar.setValue(done)
+        self.statusBar().showMessage(message)
+
+    def finish_background_progress(self, message):
+        self.progress_bar.setVisible(False)
+        self.statusBar().showMessage(message, 5000)
 
     def init_ui(self):
         # --- 工具栏 ---
@@ -1243,6 +1287,14 @@ class MainWindow(QMainWindow):
         self.act_merge.triggered.connect(self.show_merge_text_dialog)
         self.tools_menu.addAction(self.act_merge)
         
+
+        self.tools_menu.addSeparator()
+        self.act_similarity = QAction("相似度窗口", self)
+        self.act_similarity.triggered.connect(self.show_similarity_dialog)
+        self.tools_menu.addAction(self.act_similarity)
+        self.act_headword_compare = QAction("词头对比窗口", self)
+        self.act_headword_compare.triggered.connect(self.show_headword_compare_dialog)
+        self.tools_menu.addAction(self.act_headword_compare)
 
         self.btn_manage = QPushButton("Settings / Manage")
         self.btn_manage.clicked.connect(self.open_project_manager)
@@ -1300,6 +1352,24 @@ class MainWindow(QMainWindow):
         
         self.combo_ocr_engine.currentIndexChanged.connect(self.on_ocr_engine_changed)
         toolbar.addWidget(self.combo_ocr_engine)
+
+        # Model selector — only relevant for remote engine
+        self.lbl_ocr_model = QLabel(" 模型: ")
+        toolbar.addWidget(self.lbl_ocr_model)
+        self.combo_ocr_model = QComboBox()
+        for m in V2_MODELS:
+            self.combo_ocr_model.addItem(m)
+        saved_model = self.global_config.get("ocr_api_model", V2_MODELS[0])
+        midx = self.combo_ocr_model.findText(saved_model)
+        if midx >= 0:
+            self.combo_ocr_model.setCurrentIndex(midx)
+        self.combo_ocr_model.currentIndexChanged.connect(self.on_ocr_model_changed)
+        toolbar.addWidget(self.combo_ocr_model)
+
+        # Show/hide model selector based on current engine
+        is_remote = (current_engine == 'remote')
+        self.lbl_ocr_model.setVisible(is_remote)
+        self.combo_ocr_model.setVisible(is_remote)
         
         self.btn_ocr_cur = QPushButton("OCR当前页面")
         self.btn_ocr_cur.clicked.connect(self.run_current_ocr_unified)
@@ -1672,6 +1742,8 @@ class MainWindow(QMainWindow):
 
             # Force run immediately for first load? Or use deferred?
             # Use deferred to keep it async
+            self._show_similarity_after_load = not getattr(self, "_suppress_next_load_similarity_status", False)
+            self._suppress_next_load_similarity_status = False
             self.deferred_run_diff()
             
             # Record last loaded source
@@ -1856,6 +1928,12 @@ class MainWindow(QMainWindow):
                  self.ocr_diff_opcodes = opcodes
 
 
+
+        if getattr(self, "_show_similarity_after_load", False):
+            self._show_similarity_after_load = False
+            page = self.current_loaded_page if self.current_loaded_page is not None else self.spin_page.text()
+            ratio = text_similarity(text_l, text_r)
+            self.statusBar().showMessage(f"Page {page} Similarity: {ratio * 100:.2f}%")
 
     # ================= 交互 =================
 
@@ -2215,6 +2293,48 @@ class MainWindow(QMainWindow):
         # No check needed
         self.load_current_page()
 
+    def goto_page(self, page_num):
+        try:
+            page_num = int(page_num)
+        except (TypeError, ValueError):
+            return
+        if str(page_num) != self.spin_page.text():
+            self.spin_page.setText(str(page_num))
+            self.jump_page()
+            QApplication.processEvents()
+
+    def goto_headword(self, row, preferred_side="left"):
+        if not row:
+            return
+
+        side = preferred_side
+        span = row.get(f"{side}_span")
+        if not span:
+            side = "right" if side == "left" else "left"
+            span = row.get(f"{side}_span")
+        if not span:
+            return
+
+        if side == "right" and self.combo_source.currentText() != "Text File B":
+            self.combo_source.setCurrentText("Text File B")
+            QApplication.processEvents()
+        self.goto_page(row.get("page"))
+
+        editor = self.edit_left if side == "left" else self.edit_right
+        text = editor.toPlainText()
+        start_py, end_py = span
+        start_qt = to_qt_pos(text, start_py)
+        end_qt = to_qt_pos(text, end_py)
+        cursor = editor.textCursor()
+        try:
+            cursor.setPosition(start_qt)
+            cursor.setPosition(end_qt, QTextCursor.MoveMode.KeepAnchor)
+            editor.setTextCursor(cursor)
+            editor.ensureCursorVisible()
+            editor.setFocus()
+        except Exception:
+            pass
+
     def save_left_data(self):
         path = self.project_config.get('text_path_left')
         if not path:
@@ -2259,10 +2379,9 @@ class MainWindow(QMainWindow):
         engine = self.global_config.get("ocr_engine", "remote")
         
         if engine == "remote":
-            api_url = self.global_config.get("ocr_api_url")
             token = self.global_config.get("ocr_api_token")
-            if not api_url or not token:
-                QMessageBox.warning(self, "Config", "Missing URL/Token for Remote OCR")
+            if not token:
+                QMessageBox.warning(self, "Config", "Missing Token for Remote OCR (set in Settings)")
                 return
         elif engine == "local":
             if not any(e['id'] == 'local' for e in get_available_engines()):
@@ -2303,6 +2422,7 @@ class MainWindow(QMainWindow):
         worker = OCRWorker(mode, pages, self.project_config, self.global_config, engine)
         worker.project_name = self.project_config.get("name") # Tag with project name
         worker.progress.connect(self.on_ocr_progress)
+        worker.page_done.connect(self.on_ocr_page_done)
         worker.finished.connect(self.on_ocr_finished)
         
         self.ocr_thread = worker
@@ -2315,11 +2435,10 @@ class MainWindow(QMainWindow):
         # Display global progress with project context
         proj_name = getattr(worker, 'project_name', 'Unknown')
         self.statusBar().showMessage(f"[{proj_name}] {msg}")
-        
-        # Update progress bar for any batch job
-        if worker.mode == 'batch':
-             val = self.progress_bar.value()
-             self.progress_bar.setValue(val + 1)
+
+    def on_ocr_page_done(self, done: int, total: int):
+        """Slot for accurate page-level progress bar updates."""
+        self.progress_bar.setValue(done)
 
     def on_ocr_finished(self, success, msg):
         worker = self.sender()
@@ -2346,6 +2465,7 @@ class MainWindow(QMainWindow):
                 # Reload current page
                 self.combo_source.setCurrentText("OCR Results")
                 # Export methods removed and delegated to tools.export_manager.ExportManager
+                self._suppress_next_load_similarity_status = True
                 self.load_current_page()
             else:
                 QMessageBox.information(self, "Batch Done", msg)
@@ -2364,6 +2484,15 @@ class MainWindow(QMainWindow):
     def on_ocr_engine_changed(self):
         engine = self.combo_ocr_engine.currentData()
         self.global_config["ocr_engine"] = engine
+        self.config_manager.save()
+        # Show model selector only for remote engine
+        is_remote = (engine == 'remote')
+        self.lbl_ocr_model.setVisible(is_remote)
+        self.combo_ocr_model.setVisible(is_remote)
+
+    def on_ocr_model_changed(self):
+        model = self.combo_ocr_model.currentText()
+        self.global_config["ocr_api_model"] = model
         self.config_manager.save()
 
     def run_current_ocr_unified(self):
@@ -2422,7 +2551,7 @@ class MainWindow(QMainWindow):
         # After close: Config might have changed
         self.global_config = self.config_manager.get_global()
         self.project_config = self.config_manager.get_active_project()
-        
+
         self.update_project_combo()
         self.setup_shortcuts()
         self.reload_all_data()

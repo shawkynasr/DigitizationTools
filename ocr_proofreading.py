@@ -8,13 +8,13 @@ import time
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QTextEdit, QPlainTextEdit, QLabel, QPushButton, QSplitter, QFileDialog,
-                             QMessageBox, QGraphicsView, QGraphicsScene, 
+                             QMessageBox, QGraphicsView, QGraphicsScene,
                              QGraphicsRectItem, QLineEdit, QSpinBox, QToolBar, QComboBox, QCheckBox,
                              QDialog, QListWidget)
 from PyQt6.QtGui import (QTextCursor, QColor, QSyntaxHighlighter, QTextCharFormat, QTextFormat,
                          QAction, QPixmap, QImage, QPainter, QPen, QFont, QTextOption)
 from PyQt6.QtWidgets import QProgressBar
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread, pyqtSlot, QSize, QRect
+from PyQt6.QtCore import Qt, QEvent, pyqtSignal, QTimer, QThread, pyqtSlot, QSize, QRect
 import bisect
 
 from tools.pdf_tools import SplitPdfDialog, ExportPdfImageDialog
@@ -25,6 +25,7 @@ from tools.export_manager import ExportManager
 from tools.similarity_tools import SimilarityDialog, calculate_page_similarities, text_similarity
 from tools.headword_compare_tools import HeadwordCompareDialog
 from tools.report_review_tools import ReportReviewDialog
+from tools.revision_view import RevisionViewWidget
 
 from find_replace import FindReplaceDialog
 from lang.i18n import text_from_config
@@ -49,6 +50,30 @@ def to_py_pos(full_text: str, qt_pos: int) -> int:
             return i
         curr_qt += 2 if ord(c) > 0xFFFF else 1
     return len(full_text)
+
+def map_diff_index(opcodes, index, source_is_left=True):
+    """Map a Python character index through SequenceMatcher opcodes."""
+    for tag, i1, i2, j1, j2 in opcodes:
+        s1, s2 = (i1, i2) if source_is_left else (j1, j2)
+        d1, d2 = (j1, j2) if source_is_left else (i1, i2)
+        if s1 <= index < s2:
+            source_len = s2 - s1
+            target_len = d2 - d1
+            if tag == 'equal':
+                return d1 + (index - s1)
+            if source_len > 0 and target_len > 0:
+                relative = (index - s1) * target_len // source_len
+                return d1 + min(relative, target_len - 1)
+            return d1
+
+    # A cursor may legally sit just after the final character.
+    if opcodes:
+        _tag, i1, i2, j1, j2 = opcodes[-1]
+        source_end = i2 if source_is_left else j2
+        target_end = j2 if source_is_left else i2
+        if index == source_end:
+            return target_end
+    return -1
 
 # ==========================================
 # 0.1 Default Configuration
@@ -796,6 +821,22 @@ class ImageCanvas(QGraphicsView):
             x, y, w, h = navigation_bbox[:4]
             self.ensure_visible_bbox(x, y, w, h)
 
+            # A full line can be wider than the viewport. After positioning the
+            # line vertically, also bring the finest character/word box into
+            # view so the actual target cannot remain off-screen horizontally.
+            target_bbox = next(
+                (bbox for bbox in valid_bboxes if len(bbox) > 4 and bbox[4] == 'char'),
+                None,
+            )
+            if target_bbox is None:
+                target_bbox = next(
+                    (bbox for bbox in valid_bboxes if len(bbox) > 4 and bbox[4] == 'word'),
+                    valid_bboxes[0],
+                )
+            if target_bbox is not navigation_bbox:
+                tx, ty, tw, th = target_bbox[:4]
+                self.ensure_visible_bbox(tx, ty, tw, th)
+
 
 # ==========================================
 # 2.2 OCR Worker (Async)
@@ -1154,6 +1195,7 @@ class MainWindow(QMainWindow):
         
         # 初始化界面
         self.init_ui()
+        QApplication.instance().installEventFilter(self)
         
         # 加载数据
         self.reload_all_data()
@@ -1177,6 +1219,20 @@ class MainWindow(QMainWindow):
         if furi_seq:
             self.shortcut_furi = QShortcut(QKeySequence(furi_seq), self)
             self.shortcut_furi.activated.connect(self.apply_furigana_to_selection)
+
+        if hasattr(self, 'shortcut_save') and self.shortcut_save:
+            self.shortcut_save.deleteLater()
+        self.shortcut_save = QShortcut(QKeySequence.StandardKey.Save, self)
+        self.shortcut_save.activated.connect(self.save_current_side)
+
+        for name in ('shortcut_prev_page', 'shortcut_next_page'):
+            shortcut = getattr(self, name, None)
+            if shortcut:
+                shortcut.deleteLater()
+        self.shortcut_prev_page = QShortcut(QKeySequence("Ctrl+PgUp"), self)
+        self.shortcut_next_page = QShortcut(QKeySequence("Ctrl+PgDown"), self)
+        self.shortcut_prev_page.activated.connect(self.prev_page)
+        self.shortcut_next_page.activated.connect(self.next_page)
             
         # Alt+0-9 Shortcuts
         alt_texts = self.global_config.get("shortcuts_alt", [""] * 10)
@@ -1216,6 +1272,19 @@ class MainWindow(QMainWindow):
                 
     def get_text(self, key):
         return text_from_config(self.global_config, key)
+
+    def eventFilter(self, watched, event):
+        if (
+            event.type() == QEvent.Type.MouseButtonPress
+            and QApplication.activeWindow() is self
+        ):
+            if event.button() == Qt.MouseButton.BackButton:
+                self.prev_page()
+                return True
+            if event.button() == Qt.MouseButton.ForwardButton:
+                self.next_page()
+                return True
+        return super().eventFilter(watched, event)
         
     def switch_language(self, lang_code):
         self.global_config["ui_lang"] = lang_code
@@ -1463,6 +1532,11 @@ class MainWindow(QMainWindow):
         self.cb_word_wrap.toggled.connect(self.toggle_word_wrap)
         toolbar.addWidget(self.cb_word_wrap)
 
+        self.btn_revision_view = QPushButton("修订")
+        self.btn_revision_view.setToolTip("在单窗口中审阅、接受、拒绝并编辑当前页差异")
+        self.btn_revision_view.clicked.connect(self.show_revision_view)
+        toolbar.addWidget(self.btn_revision_view)
+
         self.cb_show_bboxes = QCheckBox("定位框")
         self.cb_show_bboxes.setChecked(True)
         self.cb_show_bboxes.setToolTip(
@@ -1647,6 +1721,8 @@ class MainWindow(QMainWindow):
         
         # 2.2 文本编辑器区域 (改为带 Header 的布局)
         text_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.text_splitter = text_splitter
+        self.right_text_layout = right_layout
         
         # --- Left Side Container ---
         left_container = QWidget()
@@ -2219,6 +2295,105 @@ class MainWindow(QMainWindow):
         return []
 
     # ================= Diff 核心 =================
+
+    def show_revision_view(self):
+        """Open an editable, inline revision view for the current page."""
+        self.save_current_page_data()
+        existing = getattr(self, "revision_view_widget", None)
+        if existing is not None and existing.isVisible():
+            existing.raise_()
+            return
+        try:
+            page_num = int(self.spin_page.text())
+        except ValueError:
+            page_num = self.current_loaded_page
+        self.revision_view_widget = RevisionViewWidget(
+            self,
+            self.edit_left.toPlainText(),
+            self.edit_right.toPlainText(),
+            self.apply_revision_text,
+            allow_right_target=self.is_text_source_selected(),
+            page_num=page_num,
+            navigate_page_callback=self.navigate_revision_page,
+            location_callback=self.locate_revision_position,
+            close_callback=self.close_revision_view,
+        )
+        self.text_splitter.setVisible(False)
+        self.right_text_layout.addWidget(self.revision_view_widget, 1)
+        self.revision_view_widget.show()
+
+    def close_revision_view(self):
+        widget = getattr(self, "revision_view_widget", None)
+        if widget is not None:
+            self.right_text_layout.removeWidget(widget)
+            widget.deleteLater()
+        self.revision_view_widget = None
+        self.text_splitter.setVisible(True)
+
+    def apply_revision_text(self, side, text, page_num=None):
+        try:
+            current_page = int(self.spin_page.text())
+        except ValueError:
+            current_page = self.current_loaded_page
+        if page_num is not None and page_num != current_page:
+            if side == "left":
+                self.pages_left[page_num] = text
+                self.mark_page_dirty(page_num, True)
+            elif self.is_text_source_selected():
+                self.pages_right_text[page_num] = text
+                self.current_right_dirty_pages().add(page_num)
+            return
+
+        editor = self.edit_left if side == "left" else self.edit_right
+        cursor = editor.textCursor()
+        cursor.beginEditBlock()
+        cursor.select(QTextCursor.SelectionType.Document)
+        cursor.insertText(text)
+        cursor.endEditBlock()
+        editor.setTextCursor(cursor)
+        editor.setFocus()
+        self.save_current_page_data()
+        self.deferred_run_diff()
+        self.statusBar().showMessage(
+            f"修订结果已应用到{'左侧' if side == 'left' else '右侧'}文本。", 5000
+        )
+
+    def navigate_revision_page(self, delta):
+        self._revision_internal_navigation = True
+        try:
+            if delta < 0:
+                self.prev_page()
+            else:
+                self.next_page()
+        finally:
+            self._revision_internal_navigation = False
+        QApplication.processEvents()
+        try:
+            page_num = int(self.spin_page.text())
+        except ValueError:
+            return None
+        return (
+            page_num,
+            self.edit_left.toPlainText(),
+            self.edit_right.toPlainText(),
+            self.is_text_source_selected(),
+        )
+
+    def locate_revision_position(self, page_num, side, py_position):
+        try:
+            current_page = int(self.spin_page.text())
+        except ValueError:
+            return
+        if page_num != current_page:
+            return
+        editor = self.edit_left if side == "left" else self.edit_right
+        qt_position = to_qt_pos(editor.toPlainText(), py_position)
+        cursor = editor.textCursor()
+        cursor.setPosition(min(qt_position, editor.document().characterCount() - 1))
+        editor.setTextCursor(cursor)
+        editor.highlight_line_at_index(cursor.position())
+        self.request_highlight_other(editor, cursor.position())
+        self.check_auto_scroll_bbox(editor, cursor.position())
     
     def run_ocr_mapping_diff(self, left_text):
         """计算 Left Text 到 OCR Full Text 的 Diff，用于坐标映射"""
@@ -2445,21 +2620,7 @@ class MainWindow(QMainWindow):
         py_idx = to_py_pos(src_text, qt_idx)
         
         opcodes = self.edit_left.diff_opcodes
-        mapped_py_idx = -1
-        
-        for tag, i1, i2, j1, j2 in opcodes:
-             # src range, dst range (Py indices)
-             s1, s2 = (i1, i2) if is_left_source else (j1, j2)
-             d1, d2 = (j1, j2) if is_left_source else (i1, i2)
-             
-             if s1 <= py_idx <= s2:
-                 if tag == 'equal':
-                     offset = py_idx - s1
-                     mapped_py_idx = d1 + offset
-                     if mapped_py_idx > d2: mapped_py_idx = d2
-                 else:
-                     mapped_py_idx = d1
-                 break
+        mapped_py_idx = map_diff_index(opcodes, py_idx, is_left_source)
         
         if mapped_py_idx == -1: return -1
         
@@ -2566,19 +2727,18 @@ class MainWindow(QMainWindow):
         src_py_idx = to_py_pos(editor.toPlainText(), idx)
         left_py_idx = src_py_idx
         if editor == self.edit_right:
-            left_py_idx = -1
-            for tag, i1, i2, j1, j2 in getattr(self.edit_left, 'diff_opcodes', []):
-                if j1 <= src_py_idx <= j2:
-                    left_py_idx = i1 + (src_py_idx - j1) if tag == 'equal' else i1
-                    left_py_idx = min(left_py_idx, i2)
-                    break
+            left_py_idx = map_diff_index(
+                getattr(self.edit_left, 'diff_opcodes', []),
+                src_py_idx,
+                source_is_left=False,
+            )
 
         if left_py_idx >= 0:
-            for tag, i1, i2, j1, j2 in getattr(self, 'ocr_diff_opcodes', []):
-                if i1 <= left_py_idx <= i2:
-                    target_ocr_idx = j1 + (left_py_idx - i1) if tag == 'equal' else j1
-                    target_ocr_idx = min(target_ocr_idx, j2)
-                    break
+            target_ocr_idx = map_diff_index(
+                getattr(self, 'ocr_diff_opcodes', []),
+                left_py_idx,
+                source_is_left=True,
+            )
         
         # 2. Find BBox for target_ocr_idx
         if target_ocr_idx >= 0:
@@ -2675,6 +2835,10 @@ class MainWindow(QMainWindow):
 
     def prev_page(self):
         # No check needed
+        revision = getattr(self, "revision_view_widget", None)
+        if revision is not None and not getattr(self, "_revision_internal_navigation", False):
+            revision.navigate_page(-1)
+            return
         try:
             p = int(self.spin_page.text())
             self.spin_page.setText(str(p - 1))
@@ -2683,6 +2847,10 @@ class MainWindow(QMainWindow):
 
     def next_page(self):
         # No check needed
+        revision = getattr(self, "revision_view_widget", None)
+        if revision is not None and not getattr(self, "_revision_internal_navigation", False):
+            revision.navigate_page(1)
+            return
         try:
             p = int(self.spin_page.text())
             self.spin_page.setText(str(p + 1))
@@ -2856,46 +3024,61 @@ class MainWindow(QMainWindow):
             )
 
     def save_left_data(self):
+        self.save_current_page_data()
         path = self.project_config.get('text_path_left')
         if not path:
-             # Provide Save As?
-             path, _ = QFileDialog.getSaveFileName(self, "Save Left", "", "Text (*.txt)")
-             if path: 
-                 self.project_config['text_path_left'] = path
+            self.statusBar().showMessage("左侧文本未配置保存路径。", 5000)
+            return False
         
-        if path:
-            write_pages_to_file(self.pages_left, path)
+        if write_pages_to_file(self.pages_left, path):
             self.dirty_pages_left.clear()
-            QMessageBox.information(self, "保存", f"Left data saved to {path}")
             self.config_manager.save()
+            self.statusBar().showMessage(f"左侧文本已保存：{path}", 5000)
+            return True
+        self.statusBar().showMessage(f"左侧文本保存失败：{path}", 7000)
+        return False
 
     def save_right_data(self, candidate_index=None, force=False):
         if not force and not self.is_text_source_selected():
-            QMessageBox.warning(self, "Error", "Right side is not a text file.")
+            self.statusBar().showMessage("右侧当前为 OCR 结果，不能保存为文本侧。", 5000)
             return False
 
         if candidate_index is None:
             candidate_index = getattr(self, "current_right_candidate_index", 0)
+        if candidate_index == getattr(self, "current_right_candidate_index", 0):
+            self.save_current_page_data()
         pages = self.right_candidate_pages.get(candidate_index, self.pages_right_text)
         candidates = getattr(self, "right_text_candidates", [])
         path = candidates[candidate_index].get("path", "") if 0 <= candidate_index < len(candidates) else ""
         if not path:
-             path, _ = QFileDialog.getSaveFileName(self, "Save Right", "", "Text (*.txt)")
-             if path:
-                 if candidate_index == 0:
-                     self.project_config['text_path_right'] = path
-                 else:
-                     self.right_text_candidates[candidate_index]["path"] = path
-                     if "right_text_candidates" in self.project_config and candidate_index - 1 < len(self.project_config["right_text_candidates"]):
-                         self.project_config["right_text_candidates"][candidate_index - 1]["path"] = path
+            self.statusBar().showMessage("右侧文本未配置保存路径。", 5000)
+            return False
         
-        if path:
-            write_pages_to_file(pages, path)
+        if write_pages_to_file(pages, path):
             self.dirty_pages_right.get(candidate_index, set()).clear()
-            QMessageBox.information(self, "保存", f"Right data saved to {path}")
             self.config_manager.save()
+            self.statusBar().showMessage(f"右侧文本已保存：{path}", 5000)
             return True
+        self.statusBar().showMessage(f"右侧文本保存失败：{path}", 7000)
         return False
+
+    def save_current_side(self):
+        """Save the side represented by the currently focused editing surface."""
+        focus = QApplication.focusWidget()
+        revision = getattr(self, "revision_view_widget", None)
+        if revision is not None and focus is not None and revision.isAncestorOf(focus):
+            side = revision.apply_side()
+            if not revision.apply_current(close=False, confirm_pending=False):
+                self.statusBar().showMessage("修订内容未能应用，保存已取消。", 5000)
+                return False
+        elif getattr(self, "last_active_editor", None) is self.edit_right:
+            side = "right"
+        else:
+            side = "left"
+
+        if side == "right":
+            return self.save_right_data()
+        return self.save_left_data()
 
     def save_all_dirty_right_data(self):
         for idx, pages in list(self.dirty_pages_right.items()):
@@ -3310,14 +3493,9 @@ class MainWindow(QMainWindow):
              
              # Locate Left Index corresponding to OCR Index `start_py_idx`
              # OCR is "right" side in ocr_diff_opcodes (j1, j2)
-             left_py_idx = -1
-             for tag, i1, i2, j1, j2 in opcodes:
-                 if j1 <= start_py_idx <= j2:
-                     if tag == 'equal':
-                         left_py_idx = i1 + (start_py_idx - j1)
-                     else:
-                         left_py_idx = i1 # Approximation for changed block
-                     break
+             left_py_idx = map_diff_index(
+                 opcodes, start_py_idx, source_is_left=False
+             )
              
              if left_py_idx != -1:
                  if target == self.edit_left:

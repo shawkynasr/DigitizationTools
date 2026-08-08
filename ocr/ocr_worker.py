@@ -6,6 +6,7 @@ import requests
 import re
 import fitz
 import tempfile
+from importlib import metadata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QImageReader
@@ -54,6 +55,29 @@ if importlib.util.find_spec('chrome_lens_py') is not None:
 # Detect PaddleOCR without importing it (avoids heavy startup cost)
 if importlib.util.find_spec('paddleocr') is not None:
     _ENGINES.append({'id': 'local', 'label': 'PaddleOCR (Local)', 'available': True})
+
+
+def load_chrome_lens_api():
+    """Import Chrome Lens with an actionable error for broken protobuf installs."""
+    try:
+        from chrome_lens_py import LensAPI
+        return LensAPI
+    except Exception as exc:
+        try:
+            lens_version = metadata.version("chrome-lens-py")
+        except metadata.PackageNotFoundError:
+            lens_version = "not installed"
+        try:
+            protobuf_version = metadata.version("protobuf")
+        except metadata.PackageNotFoundError:
+            protobuf_version = "not installed"
+        raise RuntimeError(
+            "Chrome Lens dependency loading failed "
+            f"(chrome-lens-py={lens_version}, protobuf={protobuf_version}). "
+            "chrome-lens-py 3.4.5 requires protobuf>=6.33.4,<7; run "
+            "'python -m pip install --upgrade \"protobuf>=6.33.4,<7\"'. "
+            f"Original error: {exc}"
+        ) from exc
 
 
 def refresh_remote_engine_label(model: str):
@@ -335,9 +359,9 @@ class OCRWorker(QThread):
 
     def _run_chrome_lens(self, img_bytes: bytes) -> dict:
         try:
-            from chrome_lens_py import LensAPI
+            LensAPI = load_chrome_lens_api()
         except Exception as e:
-            raise Exception(f"chrome-lens-py is not installed or importable: {e}")
+            raise Exception(str(e))
         try:
             import asyncio
             async def run():

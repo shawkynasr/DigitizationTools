@@ -3,6 +3,7 @@ import re
 import json
 import html
 import difflib
+from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QApplication, QDialog, QDialogButtonBox, QVBoxLayout, QHBoxLayout, QFormLayout,
@@ -135,6 +136,10 @@ class FindReplaceDialog(QDialog):
         self.tab_diff = QWidget()
         self.init_tab_diff()
         self.tabs.addTab(self.tab_diff, "Diff Filter")
+
+        self.tab_history = QWidget()
+        self.init_tab_history()
+        self.tabs.addTab(self.tab_history, self._history_text("tab"))
         
         # Scope Selection
         self.scope_group = QGroupBox("Target Text")
@@ -219,7 +224,138 @@ class FindReplaceDialog(QDialog):
         self.cb_replace.clear()
         self.cb_replace.addItems(r_hist)
         self.cb_replace.setCurrentIndex(-1)
+        self.refresh_execution_history()
         
+    def init_tab_history(self):
+        layout = QVBoxLayout(self.tab_history)
+        self.execution_history_list = QListWidget()
+        self.execution_history_list.currentRowChanged.connect(
+            self.show_execution_history_detail
+        )
+        layout.addWidget(self.execution_history_list, 2)
+
+        self.execution_history_detail = QPlainTextEdit()
+        self.execution_history_detail.setReadOnly(True)
+        layout.addWidget(self.execution_history_detail, 1)
+
+        buttons = QHBoxLayout()
+        btn_refresh = QPushButton(self._history_text("refresh"))
+        btn_refresh.clicked.connect(self.refresh_execution_history)
+        btn_clear = QPushButton(self._history_text("clear"))
+        btn_clear.clicked.connect(self.clear_execution_history)
+        buttons.addWidget(btn_refresh)
+        buttons.addWidget(btn_clear)
+        buttons.addStretch()
+        layout.addLayout(buttons)
+
+    def _history_text(self, key):
+        return self.mainwindow.get_text(f"fr_history_{key}")
+
+    def refresh_execution_history(self):
+        if not hasattr(self, "execution_history_list"):
+            return
+        self.execution_history_list.clear()
+        history = self.mainwindow.global_config.get("replace_execution_history", [])
+        for record in history:
+            find_text = str(record.get("find", "")).replace("\n", "\\n")
+            replace_text = str(record.get("replace", "")).replace("\n", "\\n")
+            if len(find_text) > 36:
+                find_text = find_text[:33] + "..."
+            if len(replace_text) > 36:
+                replace_text = replace_text[:33] + "..."
+            side = self._history_text(f'side_{record.get("side", "right")}')
+            scope = self._history_text(f'scope_{record.get("scope", "current")}')
+            item = QListWidgetItem(
+                f'{record.get("timestamp", "")} | {side} | {scope} | '
+                f'{record.get("count", 0)} {self._history_text("times")} | '
+                f'{find_text} -> {replace_text}'
+            )
+            item.setData(Qt.ItemDataRole.UserRole, record)
+            self.execution_history_list.addItem(item)
+        if self.execution_history_list.count():
+            self.execution_history_list.setCurrentRow(0)
+        else:
+            self.execution_history_detail.clear()
+
+    def show_execution_history_detail(self, row):
+        item = self.execution_history_list.item(row)
+        if item is None:
+            self.execution_history_detail.clear()
+            return
+        record = item.data(Qt.ItemDataRole.UserRole) or {}
+        side = self._history_text(f'side_{record.get("side", "right")}')
+        scope = self._history_text(f'scope_{record.get("scope", "current")}')
+        lines = [
+            f'{self._history_text("time")}: {record.get("timestamp", "")}',
+            f'{self._history_text("target")}: {side}',
+            f'{self._history_text("scope")}: {scope}',
+            f'{self._history_text("count")}: {record.get("count", 0)}',
+            f'{self._history_text("mode")}: {record.get("mode", "")}',
+            f'{self._history_text("find")}: {record.get("find", "")}',
+            f'{self._history_text("replace")}: {record.get("replace", "")}',
+        ]
+        description = record.get("description")
+        if description:
+            lines.append(f'{self._history_text("description")}: {description}')
+        details = record.get("details") or []
+        if details:
+            lines.append("")
+            lines.append(self._history_text("executed"))
+            for detail in details:
+                lines.append(
+                    f'- {detail.get("find", "")} -> {detail.get("replace", "")}'
+                )
+        self.execution_history_detail.setPlainText("\n".join(lines))
+
+    def clear_execution_history(self):
+        if not self.mainwindow.global_config.get("replace_execution_history"):
+            return
+        answer = QMessageBox.question(
+            self,
+            self._history_text("clear_title"),
+            self._history_text("clear_confirm"),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.mainwindow.global_config["replace_execution_history"] = []
+        self.mainwindow.config_manager.save()
+        self.refresh_execution_history()
+
+    def record_replace_execution(
+        self,
+        count,
+        scope,
+        *,
+        find_text=None,
+        replace_text=None,
+        mode=None,
+        description=None,
+        details=None,
+    ):
+        if count <= 0:
+            return
+        record = {
+            "timestamp": datetime.now().isoformat(sep=" ", timespec="seconds"),
+            "side": "left" if self.rb_left.isChecked() else "right",
+            "scope": scope,
+            "count": int(count),
+            "find": self.cb_find.currentText() if find_text is None else find_text,
+            "replace": self.cb_replace.currentText() if replace_text is None else replace_text,
+            "mode": self.combo_repl_mode.currentText() if mode is None else mode,
+        }
+        if description:
+            record["description"] = description
+        if details:
+            record["details"] = details
+        history = list(
+            self.mainwindow.global_config.get("replace_execution_history", [])
+        )
+        history.insert(0, record)
+        self.mainwindow.global_config["replace_execution_history"] = history[:100]
+        self.mainwindow.config_manager.save()
+        self.refresh_execution_history()
+
     def save_search_history(self):
         """Save current find/replace terms to history"""
         # 查找和替换内容中的首尾空白可能具有实际意义，必须原样保存。
@@ -956,6 +1092,21 @@ class FindReplaceDialog(QDialog):
             self.mainwindow.finalize_global_action(changed=count_total > 0)
             
         self.status_label.setText(f"Batch completed. {count_total} replacements.")
+        self.record_replace_execution(
+            count_total,
+            "template_global" if is_global else "template_current",
+            find_text=f"模板: {name}",
+            replace_text=f"{len(rules)} 条规则",
+            mode="Batch Template",
+            description=name,
+            details=[
+                {
+                    "find": str(rule.get("find", "")),
+                    "replace": str(rule.get("replace", "")),
+                }
+                for rule in rules
+            ],
+        )
 
     def on_replace_all_page(self):
         self.save_search_history()
@@ -1121,6 +1272,10 @@ class FindReplaceDialog(QDialog):
             self.mainwindow.finalize_global_action(changed=count > 0)
 
         self.status_label.setText(f"Replaced {count} occurrences.")
+        self.record_replace_execution(
+            count,
+            "global" if is_global else "current",
+        )
 
 
     def on_count(self):
@@ -1410,6 +1565,10 @@ class FindReplaceDialog(QDialog):
             
         self.close_review()
         self.status_label.setText(f"Applied {count} changes.")
+        self.record_replace_execution(
+            count,
+            "review_global" if self.review_is_global else "review_current",
+        )
         
     def _compile_regex_from_ui(self):
         pattern = self.cb_find.currentText()
@@ -1766,6 +1925,7 @@ class FindReplaceDialog(QDialog):
 
         cursor.insertText(new_text)
         self.status_label.setText("Replaced.")
+        self.record_replace_execution(1, "selection")
         
         # Find next
         self.on_find_next()

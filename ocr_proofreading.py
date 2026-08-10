@@ -10,7 +10,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QTextEdit, QPlainTextEdit, QLabel, QPushButton, QSplitter, QFileDialog,
                              QMessageBox, QGraphicsView, QGraphicsScene,
                              QGraphicsRectItem, QLineEdit, QSpinBox, QToolBar, QComboBox, QCheckBox,
-                             QDialog, QListWidget, QStackedWidget, QRadioButton, QDialogButtonBox)
+                             QDialog, QListWidget, QStackedWidget, QRadioButton, QDialogButtonBox,
+                             QToolButton, QMenu)
 from PyQt6.QtGui import (QTextCursor, QColor, QSyntaxHighlighter, QTextCharFormat, QTextFormat,
                          QAction, QPixmap, QImage, QPainter, QPen, QFont, QTextOption)
 from PyQt6.QtWidgets import QProgressBar
@@ -100,6 +101,7 @@ DEFAULT_GLOBAL_CONFIG = {
     ],
     "find_history": [],
     "replace_history": [],
+    "replace_execution_history": [],
     "shortcuts_alt": [""] * 10,
     "shortcut_furigana": "Ctrl+Shift+F",
     "furigana_left_marker": "[",
@@ -1356,12 +1358,19 @@ class MainWindow(QMainWindow):
         # Update Actions
         self.act_find.setText(self.get_text("act_find"))
         self.act_undo_global.setText(self.get_text("act_undo_global"))
+        self.act_replace_history.setText(self.get_text("act_replace_history"))
         self.act_split.setText(self.get_text("act_split"))
         self.act_exp_img.setText(self.get_text("act_exp_img"))
         self.act_merge.setText(self.get_text("act_merge"))
         self.act_similarity.setText(self.get_text("act_similarity"))
         self.act_headword_compare.setText(self.get_text("act_headword_compare"))
         self.act_report_review.setText(self.get_text("act_report_review"))
+        self.act_project_manager.setText(self.get_text("act_project_manager"))
+        self.ocr_tools_menu.setTitle(self.get_text("menu_ocr"))
+        self.ocr_button_menu.setTitle(self.get_text("menu_ocr"))
+        self.act_ocr_current.setText(self.get_text("btn_ocr_cur"))
+        self.act_ocr_pages.setText(self.get_text("btn_ocr_pages"))
+        self.act_ocr_missing.setText(self.get_text("btn_ocr_batch"))
         
         self.act_exp_slice.setText(self.get_text("act_exp_slice"))
         self.act_exp_ocr_curr.setText(self.get_text("act_exp_ocr_curr"))
@@ -1389,9 +1398,8 @@ class MainWindow(QMainWindow):
         self.cb_word_wrap.setText(self.get_text("cb_wrap"))
         self.lbl_engine.setText(self.get_text("lbl_engine"))
         self.lbl_ocr_model.setText(self.get_text("lbl_model"))
-        self.btn_ocr_cur.setText(self.get_text("btn_ocr_cur"))
-        self.btn_batch.setText(self.get_text("btn_ocr_batch"))
-        self.btn_ocr_pages.setText(self.get_text("btn_ocr_pages"))
+        if not self._ocr_task_running():
+            self.btn_ocr.setText(self.get_text("btn_ocr_main"))
                 
     def _get_focused_editor(self):
         """Return the last active editable source, rendered, or revision surface."""
@@ -1536,6 +1544,10 @@ class MainWindow(QMainWindow):
         self.act_undo_global = QAction("Global Replace History", self)
         self.act_undo_global.triggered.connect(self.show_global_replace_history)
         self.edit_menu.addAction(self.act_undo_global)
+
+        self.act_replace_history = QAction("Find/Replace Execution History", self)
+        self.act_replace_history.triggered.connect(self.show_replace_execution_history)
+        self.edit_menu.addAction(self.act_replace_history)
         
         self.tools_menu = self.menubar.addMenu("Tools (实用工具)")
         self.act_split = QAction("拆分PDF (Split PDF)", self)
@@ -1561,6 +1573,22 @@ class MainWindow(QMainWindow):
         self.act_report_review = QAction("外部报告审阅", self)
         self.act_report_review.triggered.connect(self.show_report_review_dialog)
         self.tools_menu.addAction(self.act_report_review)
+
+        self.tools_menu.addSeparator()
+        self.act_project_manager = QAction("Settings / Manage", self)
+        self.act_project_manager.triggered.connect(self.open_project_manager)
+        self.tools_menu.addAction(self.act_project_manager)
+
+        self.act_ocr_current = QAction("OCR Current", self)
+        self.act_ocr_current.triggered.connect(self.run_current_ocr_unified)
+        self.act_ocr_pages = QAction("OCR Selected Pages", self)
+        self.act_ocr_pages.triggered.connect(self.run_selected_pages_ocr)
+        self.act_ocr_missing = QAction("OCR Missing Pages", self)
+        self.act_ocr_missing.triggered.connect(self.run_batch_ocr)
+
+        self.ocr_tools_menu = self.tools_menu.addMenu("OCR")
+        for action in (self.act_ocr_current, self.act_ocr_pages, self.act_ocr_missing):
+            self.ocr_tools_menu.addAction(action)
 
         self.btn_manage = QPushButton("Settings / Manage")
         self.btn_manage.clicked.connect(self.open_project_manager)
@@ -1642,16 +1670,15 @@ class MainWindow(QMainWindow):
         self.combo_ocr_model.currentIndexChanged.connect(self.on_ocr_model_changed)
         toolbar.addWidget(self.combo_ocr_model)
         
-        self.btn_ocr_cur = QPushButton("OCR当前页面")
-        self.btn_ocr_cur.clicked.connect(self.run_current_ocr_unified)
-        toolbar.addWidget(self.btn_ocr_cur)
-        
-        self.btn_batch = QPushButton("OCR所有缺失页面")
-        self.btn_batch.clicked.connect(self.run_batch_ocr)
-        toolbar.addWidget(self.btn_batch)
-        self.btn_ocr_pages = QPushButton("OCR指定页码")
-        self.btn_ocr_pages.clicked.connect(self.run_selected_pages_ocr)
-        toolbar.addWidget(self.btn_ocr_pages)
+        self.ocr_button_menu = QMenu("OCR", self)
+        for action in (self.act_ocr_current, self.act_ocr_pages, self.act_ocr_missing):
+            self.ocr_button_menu.addAction(action)
+        self.btn_ocr = QToolButton()
+        self.btn_ocr.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self.btn_ocr.setMenu(self.ocr_button_menu)
+        self.btn_ocr.setText("OCR")
+        self.btn_ocr.clicked.connect(self.on_ocr_main_button_clicked)
+        toolbar.addWidget(self.btn_ocr)
         self.refresh_ocr_engine_combo()
 
         # Export Menu (Moved to Menu Bar)
@@ -3685,18 +3712,14 @@ class MainWindow(QMainWindow):
             status_parts.append(f"跳过 {len(missing_image_pages)} 个无图片页")
         self.statusBar().showMessage("；".join(status_parts), 6000)
 
-        self.btn_batch.setText("Cancel OCR")
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, len(available_pages))
         self.progress_bar.setValue(0)
         self.start_ocr_thread("batch", available_pages)
     def run_batch_ocr(self):
         """批量 OCR / Cancel"""
-        # Toggle Logic: Cancel
-        if hasattr(self, 'ocr_thread') and self.ocr_thread and self.ocr_thread.isRunning():
-            self.ocr_thread.stop()
-            self.btn_batch.setText("Stopping...")
-            self.btn_batch.setEnabled(False)
+        if self._ocr_task_running():
+            self.cancel_ocr_task()
             return
 
         # Check prereqs based on engine
@@ -3766,7 +3789,6 @@ class MainWindow(QMainWindow):
             return
             
         # Direct Start with Cancel Option
-        self.btn_batch.setText("Cancel OCR")
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, len(ocr_pages))
         self.progress_bar.setValue(0)
@@ -3791,7 +3813,40 @@ class MainWindow(QMainWindow):
         )
         
         self.ocr_thread = worker
+        self._set_ocr_task_ui(running=True)
         self.ocr_thread.start()
+
+    def _ocr_task_running(self):
+        worker = getattr(self, "ocr_thread", None)
+        return bool(worker and worker.isRunning())
+
+    def _set_ocr_task_ui(self, running=False, stopping=False):
+        if not hasattr(self, "btn_ocr"):
+            return
+        available = self.combo_ocr_engine.currentData() is not None
+        if stopping:
+            self.btn_ocr.setText(self.get_text("btn_ocr_stopping"))
+            self.btn_ocr.setEnabled(False)
+        elif running:
+            self.btn_ocr.setText(self.get_text("btn_ocr_cancel"))
+            self.btn_ocr.setEnabled(True)
+        else:
+            self.btn_ocr.setText(self.get_text("btn_ocr_main"))
+            self.btn_ocr.setEnabled(available)
+        for action in (self.act_ocr_current, self.act_ocr_pages, self.act_ocr_missing):
+            action.setEnabled(available and not running and not stopping)
+
+    def on_ocr_main_button_clicked(self):
+        if self._ocr_task_running():
+            self.cancel_ocr_task()
+        else:
+            self.run_current_ocr_unified()
+
+    def cancel_ocr_task(self):
+        worker = getattr(self, "ocr_thread", None)
+        if worker and worker.isRunning():
+            worker.stop()
+            self._set_ocr_task_ui(stopping=True)
 
     def on_ocr_progress(self, msg):
         worker = self.sender()
@@ -3815,11 +3870,9 @@ class MainWindow(QMainWindow):
 
         # OCR 状态属于任务而不是启动任务时所在的页面，切页后也必须复位。
         if is_active_worker:
-            if hasattr(self, 'btn_batch'):
-                self.btn_batch.setText("OCR所有缺失页面")
-                self.btn_batch.setEnabled(True)
             self.progress_bar.setVisible(False)
             self.ocr_thread = None
+            self._set_ocr_task_ui(running=False)
 
         if worker.mode == 'single':
             QApplication.restoreOverrideCursor()
@@ -3895,9 +3948,7 @@ class MainWindow(QMainWindow):
                 self.config_manager.save()
         self.combo_ocr_engine.setCurrentIndex(idx)
         self.combo_ocr_engine.blockSignals(False)
-        self.btn_ocr_cur.setEnabled(bool(available_engines))
-        self.btn_batch.setEnabled(bool(available_engines))
-        self.btn_ocr_pages.setEnabled(bool(available_engines))
+        self._set_ocr_task_ui(running=self._ocr_task_running())
         self.refresh_ocr_model_combo(self.combo_ocr_engine.currentData())
 
     def refresh_ocr_model_combo(self, engine):
@@ -4131,6 +4182,13 @@ class MainWindow(QMainWindow):
 
     def reload_displayed_texts(self):
         self.load_current_page()
+
+    def show_replace_execution_history(self):
+        self.show_find_replace()
+        self.find_replace_dialog.refresh_execution_history()
+        self.find_replace_dialog.tabs.setCurrentWidget(
+            self.find_replace_dialog.tab_history
+        )
 
     def show_find_replace(self):
         if not self.find_replace_dialog:

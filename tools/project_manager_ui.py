@@ -6,18 +6,27 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTabWidget, QWid
                              QCheckBox, QDoubleSpinBox)
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QKeySequence
-from ocr.ocr_engines import ENGINE_DEFS, PADDLE_ENGINE_ID, canonical_engine_id
+from ocr.ocr_engines import (
+    ENGINE_DEFS, OCR_CATEGORY_OPTIONS, PADDLE_ENGINE_ID,
+    canonical_engine_id, excluded_categories,
+)
 from ocr.ocr_worker import refresh_remote_engine_label
+from lang.i18n import text_from_config
 
 class ProjectManagerDialog(QDialog):
     settings_changed = pyqtSignal()
 
+    def _text(self, key, **values):
+        template = text_from_config(
+            self.config_manager.get_global(),
+            f"pm_{key}",
+        )
+        return template.format(**values)
     def __init__(self, parent, config_manager):
         super().__init__(parent)
-        self.setWindowTitle("Settings & Project Manager")
-        self.resize(800, 600)
         self.config_manager = config_manager
-        
+        self.setWindowTitle(self._text("window_title"))
+        self.resize(800, 600)
         # UI Layout
         layout = QVBoxLayout(self)
         self.tabs = QTabWidget()
@@ -26,19 +35,20 @@ class ProjectManagerDialog(QDialog):
         # Tab 1: Global Settings
         self.tab_global = QWidget()
         self.init_global_tab()
-        self.tabs.addTab(self.tab_global, "Global Settings")
+        self.tabs.addTab(self.tab_global, self._text("tab_global"))
 
         self.tab_ocr = QWidget()
         self.init_ocr_tab()
-        self.tabs.addTab(self.tab_ocr, "OCR Engines")
+        self.tabs.addTab(self.tab_ocr, self._text("tab_ocr"))
         
         # Tab 2: Projects
         self.tab_projects = QWidget()
         self.init_projects_tab()
-        self.tabs.addTab(self.tab_projects, "Projects")
+        self.tabs.addTab(self.tab_projects, self._text("tab_projects"))
         
         # Buttons
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        btns.button(QDialogButtonBox.StandardButton.Close).setText(self._text("close"))
         btns.rejected.connect(self.accept) # Close acts as confirm/exit
         layout.addWidget(btns)
         
@@ -53,30 +63,30 @@ class ProjectManagerDialog(QDialog):
         # Shortcuts logic
         self.input_furigana.setKeySequence(QKeySequence(g.get("shortcut_furigana", "Ctrl+Shift+F")))
         self.input_furigana.keySequenceChanged.connect(self.save_global)
-        layout.addRow("Furigana Shortcut:", self.input_furigana)
+        layout.addRow(self._text("furigana_shortcut"), self.input_furigana)
 
         self.input_furigana_left = QLineEdit()
         self.input_furigana_left.setText(g.get("furigana_left_marker", "["))
         self.input_furigana_left.textChanged.connect(self.save_global)
-        layout.addRow("Ruby Left Marker:", self.input_furigana_left)
+        layout.addRow(self._text("ruby_left"), self.input_furigana_left)
 
         self.input_furigana_right = QLineEdit()
         self.input_furigana_right.setText(g.get("furigana_right_marker", "]"))
         self.input_furigana_right.textChanged.connect(self.save_global)
-        layout.addRow("Ruby Right Marker:", self.input_furigana_right)
+        layout.addRow(self._text("ruby_right"), self.input_furigana_right)
 
         self.combo_furigana_kana = QComboBox()
-        self.combo_furigana_kana.addItem("Hiragana", "hiragana")
-        self.combo_furigana_kana.addItem("Katakana", "katakana")
+        self.combo_furigana_kana.addItem(self._text("hiragana"), "hiragana")
+        self.combo_furigana_kana.addItem(self._text("katakana"), "katakana")
         kana_idx = self.combo_furigana_kana.findData(g.get("furigana_kana_type", "hiragana"))
         self.combo_furigana_kana.setCurrentIndex(kana_idx if kana_idx >= 0 else 0)
         self.combo_furigana_kana.currentIndexChanged.connect(self.save_global)
-        layout.addRow("Ruby Reading Kana:", self.combo_furigana_kana)
+        layout.addRow(self._text("ruby_kana"), self.combo_furigana_kana)
 
         self.chk_furigana_split = QCheckBox()
         self.chk_furigana_split.setChecked(bool(g.get("furigana_use_jmdict_split", True)))
         self.chk_furigana_split.toggled.connect(self.save_global)
-        layout.addRow("Split Readings (JMDict):", self.chk_furigana_split)
+        layout.addRow(self._text("jmdict_split"), self.chk_furigana_split)
         
         alt_texts = g.get("shortcuts_alt", [""] * 10)
         for i in range(10):
@@ -84,7 +94,7 @@ class ProjectManagerDialog(QDialog):
             le.setText(alt_texts[i] if i < len(alt_texts) else "")
             le.textChanged.connect(self.save_global)
             self.inputs_alt.append(le)
-            layout.addRow(f"Alt+{i} Text:", le)
+            layout.addRow(self._text("alt_text", index=i), le)
 
     def init_ocr_tab(self):
         layout = QHBoxLayout(self.tab_ocr)
@@ -99,7 +109,7 @@ class ProjectManagerDialog(QDialog):
         self.ocr_nav.currentRowChanged.connect(self.ocr_pages.setCurrentIndex)
 
         # Common settings
-        common_page, common_layout = self._add_ocr_page("通用设置")
+        common_page, common_layout = self._add_ocr_page(self._text("common_settings"))
         self.spin_retry = QSpinBox()
         self.spin_retry.setRange(1, 10)
         self.spin_retry.setValue(int(g.get("ocr_retry_count", 3)))
@@ -110,10 +120,20 @@ class ProjectManagerDialog(QDialog):
         self.spin_concurrent.setValue(int(g.get("ocr_concurrent_tasks", 2)))
         self.spin_concurrent.valueChanged.connect(self.save_global)
 
-        self.input_excluded_labels = QLineEdit()
-        self.input_excluded_labels.setText(g.get("ocr_excluded_labels", "image,table,formula,Illustration,PrintedFormula,WrittenFormula"))
-        self.input_excluded_labels.textChanged.connect(self.save_global)
-
+        self.list_excluded_categories = QListWidget()
+        self.list_excluded_categories.setMinimumHeight(220)
+        selected_categories = excluded_categories(g)
+        for category_id, category_label in OCR_CATEGORY_OPTIONS:
+            item = QListWidgetItem(self._text(f"category_{category_id}"))
+            item.setData(Qt.ItemDataRole.UserRole, category_id)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked
+                if category_id in selected_categories
+                else Qt.CheckState.Unchecked
+            )
+            self.list_excluded_categories.addItem(item)
+        self.list_excluded_categories.itemChanged.connect(self.save_global)
         self.list_ocr_priority = QListWidget()
         priority = g.get("ocr_result_priority") or [PADDLE_ENGINE_ID, "chrome_lens", "textin", "mineru", "quark", "local"]
         seen_priority = set()
@@ -129,17 +149,17 @@ class ProjectManagerDialog(QDialog):
         priority_buttons = QWidget()
         priority_buttons_layout = QHBoxLayout(priority_buttons)
         priority_buttons_layout.setContentsMargins(0, 0, 0, 0)
-        self.btn_ocr_priority_up = QPushButton("Up")
-        self.btn_ocr_priority_down = QPushButton("Down")
+        self.btn_ocr_priority_up = QPushButton(self._text("move_up"))
+        self.btn_ocr_priority_down = QPushButton(self._text("move_down"))
         self.btn_ocr_priority_up.clicked.connect(lambda: self.move_ocr_priority(-1))
         self.btn_ocr_priority_down.clicked.connect(lambda: self.move_ocr_priority(1))
         priority_buttons_layout.addWidget(self.btn_ocr_priority_up)
         priority_buttons_layout.addWidget(self.btn_ocr_priority_down)
 
-        common_layout.addRow("Retry Count:", self.spin_retry)
-        common_layout.addRow("Concurrent Tasks:", self.spin_concurrent)
-        common_layout.addRow("Excluded Labels:", self.input_excluded_labels)
-        common_layout.addRow("OCR Result Priority:", self.list_ocr_priority)
+        common_layout.addRow(self._text("retry_count"), self.spin_retry)
+        common_layout.addRow(self._text("concurrent_tasks"), self.spin_concurrent)
+        common_layout.addRow(self._text("hidden_categories"), self.list_excluded_categories)
+        common_layout.addRow(self._text("ocr_priority"), self.list_ocr_priority)
         common_layout.addRow("", priority_buttons)
 
         paddle_page, paddle_layout = self._add_ocr_page("PaddleOCR")
@@ -156,12 +176,12 @@ class ProjectManagerDialog(QDialog):
         self.chk_paddle_chart.setChecked(bool(paddle.get("useChartRecognition", False)))
         for widget in [self.chk_paddle_orientation, self.chk_paddle_unwarp, self.chk_paddle_chart]:
             widget.toggled.connect(self.save_global)
-        paddle_layout.addRow("API Token:", self.input_api_token)
-        paddle_layout.addRow("Use Orientation Classify:", self.chk_paddle_orientation)
-        paddle_layout.addRow("Use Doc Unwarping:", self.chk_paddle_unwarp)
-        paddle_layout.addRow("Use Chart Recognition:", self.chk_paddle_chart)
+        paddle_layout.addRow(self._text("api_token"), self.input_api_token)
+        paddle_layout.addRow(self._text("orientation"), self.chk_paddle_orientation)
+        paddle_layout.addRow(self._text("unwarp"), self.chk_paddle_unwarp)
+        paddle_layout.addRow(self._text("chart_recognition"), self.chk_paddle_chart)
 
-        textin_page, textin_layout = self._add_ocr_page("Textin")
+        textin_page, textin_layout = self._add_ocr_page("TextIn")
         textin = engines.setdefault("textin", {})
         self.input_textin_app_id = QLineEdit(textin.get("app_id", ""))
         self.input_textin_secret = QLineEdit(textin.get("secret_code", ""))
@@ -187,19 +207,25 @@ class ProjectManagerDialog(QDialog):
         self.chk_textin_crop_dewarp = QCheckBox()
         self.chk_textin_crop_dewarp.setChecked(bool(textin.get("crop_dewarp", False)))
         self.combo_textin_table_view = QComboBox()
-        for value in ["html", "markdown"]:
-            self.combo_textin_table_view.addItem(value, value)
+        self.combo_textin_table_view.addItem("HTML", "html")
+        self.combo_textin_table_view.addItem("Markdown", "markdown")
         idx = self.combo_textin_table_view.findData(textin.get("table_view", "html"))
         self.combo_textin_table_view.setCurrentIndex(idx if idx >= 0 else 0)
         self.combo_textin_force_engine = QComboBox()
-        self.combo_textin_force_engine.addItem("默认", "")
+        self.combo_textin_force_engine.addItem(self._text("default"), "")
         for value in ["textin", "mineru", "paddle_ocr", "textin_gui"]:
             self.combo_textin_force_engine.addItem(value, value)
         idx = self.combo_textin_force_engine.findData(textin.get("force_engine", ""))
         self.combo_textin_force_engine.setCurrentIndex(idx if idx >= 0 else 0)
         self.combo_textin_parse_mode = QComboBox()
-        for value in ["auto", "scan", "parse", "lite", "vlm"]:
-            self.combo_textin_parse_mode.addItem(value, value)
+        for label, value in [
+            (self._text("automatic"), "auto"),
+            (self._text("scan_document"), "scan"),
+            (self._text("parse_document"), "parse"),
+            (self._text("lite_mode"), "lite"),
+            (self._text("vlm_mode"), "vlm"),
+        ]:
+            self.combo_textin_parse_mode.addItem(label, value)
         idx = self.combo_textin_parse_mode.findData(textin.get("parse_mode", "auto"))
         self.combo_textin_parse_mode.setCurrentIndex(idx if idx >= 0 else 0)
         self.spin_textin_formula_level = QSpinBox()
@@ -208,30 +234,30 @@ class ProjectManagerDialog(QDialog):
         self.chk_textin_recognize_chemical = QCheckBox()
         self.chk_textin_recognize_chemical.setChecked(bool(textin.get("recognize_chemical", False)))
         self.combo_textin_image_output_type = QComboBox()
-        for value in ["url", "base64"]:
-            self.combo_textin_image_output_type.addItem(value, value)
+        self.combo_textin_image_output_type.addItem(self._text("image_url"), "url")
+        self.combo_textin_image_output_type.addItem(self._text("base64_data"), "base64")
         idx = self.combo_textin_image_output_type.findData(textin.get("image_output_type", "url"))
         self.combo_textin_image_output_type.setCurrentIndex(idx if idx >= 0 else 0)
-        textin_layout.addRow("App ID:", self.input_textin_app_id)
-        textin_layout.addRow("Secret Code:", self.input_textin_secret)
-        textin_layout.addRow("Endpoint:", self.input_textin_endpoint)
-        textin_layout.addRow("PDF Password:", self.input_textin_password)
-        textin_layout.addRow("Page Range:", self.input_textin_page_range)
-        textin_layout.addRow("Include Hierarchy:", self.chk_textin_hierarchy)
-        textin_layout.addRow("Include Inline Objects:", self.chk_textin_inline_objects)
-        textin_layout.addRow("Include Table Structure:", self.chk_textin_table)
-        textin_layout.addRow("Include Char Details:", self.chk_textin_chars)
-        textin_layout.addRow("Include Image Data:", self.chk_textin_images)
-        textin_layout.addRow("Return Pages:", self.chk_textin_pages)
-        textin_layout.addRow("Title Tree:", self.chk_textin_title_tree)
-        textin_layout.addRow("Table View:", self.combo_textin_table_view)
-        textin_layout.addRow("Remove Watermark:", self.chk_textin_remove_watermark)
-        textin_layout.addRow("Crop Dewarp:", self.chk_textin_crop_dewarp)
-        textin_layout.addRow("Force Engine:", self.combo_textin_force_engine)
-        textin_layout.addRow("Parse Mode:", self.combo_textin_parse_mode)
-        textin_layout.addRow("Formula Level:", self.spin_textin_formula_level)
-        textin_layout.addRow("Recognize Chemical:", self.chk_textin_recognize_chemical)
-        textin_layout.addRow("Image Output Type:", self.combo_textin_image_output_type)
+        textin_layout.addRow(self._text("app_id"), self.input_textin_app_id)
+        textin_layout.addRow(self._text("secret"), self.input_textin_secret)
+        textin_layout.addRow(self._text("endpoint"), self.input_textin_endpoint)
+        textin_layout.addRow(self._text("pdf_password"), self.input_textin_password)
+        textin_layout.addRow(self._text("page_range"), self.input_textin_page_range)
+        textin_layout.addRow(self._text("include_hierarchy"), self.chk_textin_hierarchy)
+        textin_layout.addRow(self._text("include_inline"), self.chk_textin_inline_objects)
+        textin_layout.addRow(self._text("include_table"), self.chk_textin_table)
+        textin_layout.addRow(self._text("include_chars"), self.chk_textin_chars)
+        textin_layout.addRow(self._text("include_images"), self.chk_textin_images)
+        textin_layout.addRow(self._text("return_pages"), self.chk_textin_pages)
+        textin_layout.addRow(self._text("title_tree"), self.chk_textin_title_tree)
+        textin_layout.addRow(self._text("table_format"), self.combo_textin_table_view)
+        textin_layout.addRow(self._text("remove_watermark"), self.chk_textin_remove_watermark)
+        textin_layout.addRow(self._text("crop_dewarp"), self.chk_textin_crop_dewarp)
+        textin_layout.addRow(self._text("force_engine"), self.combo_textin_force_engine)
+        textin_layout.addRow(self._text("parse_mode"), self.combo_textin_parse_mode)
+        textin_layout.addRow(self._text("formula_level"), self.spin_textin_formula_level)
+        textin_layout.addRow(self._text("chemical"), self.chk_textin_recognize_chemical)
+        textin_layout.addRow(self._text("image_output"), self.combo_textin_image_output_type)
 
         mineru_page, mineru_layout = self._add_ocr_page("MinerU")
         mineru = engines.setdefault("mineru", {})
@@ -240,22 +266,22 @@ class ProjectManagerDialog(QDialog):
         self.input_mineru_poll = QLineEdit(mineru.get("poll_endpoint", "https://mineru.net/api/v4/extract-results/batch/{batch_id}"))
         self.combo_mineru_language = QComboBox()
         mineru_languages = [
-            ("ch", "ch - 中英文（默认）"),
-            ("ch_server", "ch_server - 繁体、手写体"),
-            ("en", "en - 纯英文"),
-            ("japan", "japan - 日文为主"),
-            ("korean", "korean - 韩文"),
-            ("chinese_cht", "chinese_cht - 繁体中文为主"),
-            ("ta", "ta - 泰米尔文"),
-            ("te", "te - 泰卢固文"),
-            ("ka", "ka - 卡纳达文"),
-            ("el", "el - 希腊文"),
-            ("th", "th - 泰文"),
-            ("latin", "latin - 拉丁语系"),
-            ("arabic", "arabic - 阿拉伯语系"),
-            ("cyrillic", "cyrillic - 西里尔语系"),
-            ("east_slavic", "east_slavic - 东斯拉夫语系"),
-            ("devanagari", "devanagari - 天城文语系"),
+            ("ch", self._text("lang_ch")),
+            ("ch_server", self._text("lang_ch_server")),
+            ("en", self._text("lang_en")),
+            ("japan", self._text("lang_japan")),
+            ("korean", self._text("lang_korean")),
+            ("chinese_cht", self._text("lang_cht")),
+            ("ta", self._text("lang_ta")),
+            ("te", self._text("lang_te")),
+            ("ka", self._text("lang_ka")),
+            ("el", self._text("lang_el")),
+            ("th", self._text("lang_th")),
+            ("latin", self._text("lang_latin")),
+            ("arabic", self._text("lang_arabic")),
+            ("cyrillic", self._text("lang_cyrillic")),
+            ("east_slavic", self._text("lang_east_slavic")),
+            ("devanagari", self._text("lang_devanagari")),
         ]
         for value, label in mineru_languages:
             self.combo_mineru_language.addItem(label, value)
@@ -274,42 +300,48 @@ class ProjectManagerDialog(QDialog):
         self.spin_mineru_poll_interval = QDoubleSpinBox()
         self.spin_mineru_poll_interval.setRange(0.5, 30)
         self.spin_mineru_poll_interval.setValue(float(mineru.get("poll_interval", 2)))
-        mineru_layout.addRow("Token:", self.input_mineru_token)
-        mineru_layout.addRow("Create Endpoint:", self.input_mineru_endpoint)
-        mineru_layout.addRow("Poll Endpoint:", self.input_mineru_poll)
-        mineru_layout.addRow("Language:", self.combo_mineru_language)
-        mineru_layout.addRow("Model Version:", self.input_mineru_model)
-        mineru_layout.addRow("Extra Formats:", self.input_mineru_extra_formats)
-        mineru_layout.addRow("Enable Table:", self.chk_mineru_table)
-        mineru_layout.addRow("Enable Formula:", self.chk_mineru_formula)
-        mineru_layout.addRow("Force OCR:", self.chk_mineru_ocr)
-        mineru_layout.addRow("No Cache:", self.chk_mineru_no_cache)
-        mineru_layout.addRow("Poll Interval:", self.spin_mineru_poll_interval)
+        mineru_layout.addRow(self._text("token"), self.input_mineru_token)
+        mineru_layout.addRow(self._text("create_endpoint"), self.input_mineru_endpoint)
+        mineru_layout.addRow(self._text("poll_endpoint"), self.input_mineru_poll)
+        mineru_layout.addRow(self._text("language"), self.combo_mineru_language)
+        mineru_layout.addRow(self._text("model_version"), self.input_mineru_model)
+        mineru_layout.addRow(self._text("extra_formats"), self.input_mineru_extra_formats)
+        mineru_layout.addRow(self._text("enable_table"), self.chk_mineru_table)
+        mineru_layout.addRow(self._text("enable_formula"), self.chk_mineru_formula)
+        mineru_layout.addRow(self._text("force_ocr"), self.chk_mineru_ocr)
+        mineru_layout.addRow(self._text("no_cache"), self.chk_mineru_no_cache)
+        mineru_layout.addRow(self._text("poll_interval"), self.spin_mineru_poll_interval)
 
-        quark_page, quark_layout = self._add_ocr_page("Quark")
+        quark_page, quark_layout = self._add_ocr_page(self._text("quark_page"))
         quark = engines.setdefault("quark", {})
         self.input_quark_client_id = QLineEdit(quark.get("client_id", ""))
         self.input_quark_client_secret = QLineEdit(quark.get("client_secret", ""))
         self.input_quark_endpoint = QLineEdit(quark.get("endpoint", "https://scan-business.quark.cn/vision"))
         self.combo_quark_function = QComboBox()
-        for value in ["RecognizeGeneralDocument"]:
-            self.combo_quark_function.addItem(value, value)
+        self.combo_quark_function.addItem(self._text("general_document"), "RecognizeGeneralDocument")
         idx = self.combo_quark_function.findData(quark.get("function_option", "RecognizeGeneralDocument"))
         self.combo_quark_function.setCurrentIndex(idx if idx >= 0 else 0)
         self.chk_quark_return_image = QCheckBox()
         self.chk_quark_return_image.setChecked(bool(quark.get("need_return_image", True)))
         self.input_quark_sign_method = QLineEdit(quark.get("sign_method", "SHA3-256"))
-        quark_layout.addRow("Client ID:", self.input_quark_client_id)
-        quark_layout.addRow("Client Secret:", self.input_quark_client_secret)
-        quark_layout.addRow("Endpoint:", self.input_quark_endpoint)
-        quark_layout.addRow("Sign Method:", self.input_quark_sign_method)
-        quark_layout.addRow("Function:", self.combo_quark_function)
-        quark_layout.addRow("Return Image:", self.chk_quark_return_image)
+        quark_layout.addRow(self._text("client_id"), self.input_quark_client_id)
+        quark_layout.addRow(self._text("client_secret"), self.input_quark_client_secret)
+        quark_layout.addRow(self._text("endpoint"), self.input_quark_endpoint)
+        quark_layout.addRow(self._text("sign_method"), self.input_quark_sign_method)
+        quark_layout.addRow(self._text("function"), self.combo_quark_function)
+        quark_layout.addRow(self._text("return_image"), self.chk_quark_return_image)
 
-        chrome_page, chrome_layout = self._add_ocr_page("Chrome Lens")
+        chrome_page, chrome_layout = self._add_ocr_page("ChromeLens")
         chrome_lens = engines.setdefault("chrome_lens", {})
-        self.input_chrome_lens_note = QLineEdit(chrome_lens.get("note", "Requires chrome-lens-py package; no token"))
-        chrome_layout.addRow("Note:", self.input_chrome_lens_note)
+        chrome_note = chrome_lens.get("note", self._text("chrome_note"))
+        if chrome_note in {
+            "Requires chrome-lens-py package; no token",
+            text_from_config({"ui_lang": "zh"}, "pm_chrome_note"),
+            text_from_config({"ui_lang": "en"}, "pm_chrome_note"),
+        }:
+            chrome_note = self._text("chrome_note")
+        self.input_chrome_lens_note = QLineEdit(chrome_note)
+        chrome_layout.addRow(self._text("note"), self.input_chrome_lens_note)
 
         for widget in [
             self.input_textin_app_id, self.input_textin_secret, self.input_textin_endpoint,
@@ -371,8 +403,12 @@ class ProjectManagerDialog(QDialog):
             g["ocr_retry_count"] = self.spin_retry.value()
         if hasattr(self, "spin_concurrent"):
             g["ocr_concurrent_tasks"] = self.spin_concurrent.value()
-        if hasattr(self, "input_excluded_labels"):
-            g["ocr_excluded_labels"] = self.input_excluded_labels.text()
+        if hasattr(self, "list_excluded_categories"):
+            g["ocr_excluded_categories"] = [
+                self.list_excluded_categories.item(index).data(Qt.ItemDataRole.UserRole)
+                for index in range(self.list_excluded_categories.count())
+                if self.list_excluded_categories.item(index).checkState() == Qt.CheckState.Checked
+            ]
         if hasattr(self, "list_ocr_priority"):
             g["ocr_result_priority"] = [
                 self.list_ocr_priority.item(i).data(Qt.ItemDataRole.UserRole)
@@ -452,9 +488,9 @@ class ProjectManagerDialog(QDialog):
         self.list_projects.currentRowChanged.connect(self.load_selected_project)
         left_layout.addWidget(self.list_projects)
         
-        btn_add = QPushButton("New Project")
+        btn_add = QPushButton(self._text("new_project"))
         btn_add.clicked.connect(self.add_project)
-        btn_del = QPushButton("Delete Project")
+        btn_del = QPushButton(self._text("delete_project"))
         btn_del.clicked.connect(self.delete_project)
         
         left_layout.addWidget(btn_add)
@@ -469,27 +505,27 @@ class ProjectManagerDialog(QDialog):
         # 1. Project Name (Editable)
         self.inp_name = QLineEdit()
         self.inp_name.editingFinished.connect(self.save_current_project)
-        self.form_layout.addRow("Name:", self.inp_name)
+        self.form_layout.addRow(self._text("project_name"), self.inp_name)
         
         # 2. Paths with Browse Buttons
-        self.inp_pdf = self.add_browse_row("PDF Path:", "file", "PDF Files (*.pdf)")
-        self.inp_left_txt = self.add_browse_row("Left Text:", "file", "Text (*.txt)")
-        self.inp_right_txt = self.add_browse_row("Right Text:", "file", "Text (*.txt)")
+        self.inp_pdf = self.add_browse_row(self._text("pdf_file"), "file", self._text("pdf_filter"))
+        self.inp_left_txt = self.add_browse_row(self._text("left_text"), "file", self._text("text_filter"))
+        self.inp_right_txt = self.add_browse_row(self._text("right_text"), "file", self._text("text_filter"))
         self.list_right_candidates = QListWidget()
         candidate_buttons = QWidget()
         candidate_buttons_layout = QHBoxLayout(candidate_buttons)
         candidate_buttons_layout.setContentsMargins(0, 0, 0, 0)
-        self.btn_add_right_candidate = QPushButton("Add")
-        self.btn_remove_right_candidate = QPushButton("Remove")
+        self.btn_add_right_candidate = QPushButton(self._text("add"))
+        self.btn_remove_right_candidate = QPushButton(self._text("remove"))
         self.btn_add_right_candidate.clicked.connect(self.add_right_candidate)
         self.btn_remove_right_candidate.clicked.connect(self.remove_right_candidate)
         candidate_buttons_layout.addWidget(self.btn_add_right_candidate)
         candidate_buttons_layout.addWidget(self.btn_remove_right_candidate)
-        self.form_layout.addRow("Other Right Texts:", self.list_right_candidates)
+        self.form_layout.addRow(self._text("other_right"), self.list_right_candidates)
         self.form_layout.addRow("", candidate_buttons)
-        self.inp_img_dir = self.add_browse_row("Image Dir:", "dir")
-        self.inp_ocr_json = self.add_browse_row("OCR JSON Dir:", "dir")
-        self.inp_export_dir = self.add_browse_row("Export Dir:", "dir")
+        self.inp_img_dir = self.add_browse_row(self._text("image_dir"), "dir")
+        self.inp_ocr_json = self.add_browse_row(self._text("ocr_dir"), "dir")
+        self.inp_export_dir = self.add_browse_row(self._text("export_dir"), "dir")
         
         # 3. Numeric Fields
         self.spin_start = QSpinBox(); self.spin_start.setRange(1, 9999)
@@ -500,9 +536,9 @@ class ProjectManagerDialog(QDialog):
         self.spin_end.valueChanged.connect(self.save_current_project)
         self.spin_offset.valueChanged.connect(self.save_current_project)
         
-        self.form_layout.addRow("Start Page:", self.spin_start)
-        self.form_layout.addRow("End Page:", self.spin_end)
-        self.form_layout.addRow("Page Offset:", self.spin_offset)
+        self.form_layout.addRow(self._text("start_page"), self.spin_start)
+        self.form_layout.addRow(self._text("end_page"), self.spin_end)
+        self.form_layout.addRow(self._text("page_offset"), self.spin_offset)
         
         # 4. Regex
         self.inp_reg_l = QLineEdit()
@@ -516,11 +552,11 @@ class ProjectManagerDialog(QDialog):
         self.spin_reg_grp_l.valueChanged.connect(self.save_current_project)
         self.spin_reg_grp_r.valueChanged.connect(self.save_current_project)
 
-        h_l = QHBoxLayout(); h_l.addWidget(self.inp_reg_l); h_l.addWidget(QLabel("Grp:")); h_l.addWidget(self.spin_reg_grp_l)
-        h_r = QHBoxLayout(); h_r.addWidget(self.inp_reg_r); h_r.addWidget(QLabel("Grp:")); h_r.addWidget(self.spin_reg_grp_r)
+        h_l = QHBoxLayout(); h_l.addWidget(self.inp_reg_l); h_l.addWidget(QLabel(self._text("group"))); h_l.addWidget(self.spin_reg_grp_l)
+        h_r = QHBoxLayout(); h_r.addWidget(self.inp_reg_r); h_r.addWidget(QLabel(self._text("group"))); h_r.addWidget(self.spin_reg_grp_r)
         
-        self.form_layout.addRow("Regex Left:", h_l)
-        self.form_layout.addRow("Regex Right:", h_r)
+        self.form_layout.addRow(self._text("regex_left"), h_l)
+        self.form_layout.addRow(self._text("regex_right"), h_r)
         
         layout.addWidget(self.form_widget, 2)
         
@@ -549,9 +585,9 @@ class ProjectManagerDialog(QDialog):
         current = line_edit.text()
         path = ""
         if mode == "file":
-             path, _ = QFileDialog.getOpenFileName(self, "Select File", current, filter_str)
+             path, _ = QFileDialog.getOpenFileName(self, self._text("select_file"), current, filter_str)
         else:
-             path = QFileDialog.getExistingDirectory(self, "Select Directory", current)
+             path = QFileDialog.getExistingDirectory(self, self._text("select_dir"), current)
              
         if path:
             line_edit.setText(path)
@@ -630,7 +666,7 @@ class ProjectManagerDialog(QDialog):
         new_name = self.inp_name.text().strip()
         if new_name and new_name != self.current_project_original_name:
             if self.config_manager.get_project(new_name):
-                QMessageBox.warning(self, "Error", "Project name already exists!")
+                QMessageBox.warning(self, self._text("error"), self._text("name_exists"))
                 self.inp_name.setText(self.current_project_original_name) # Revert
                 return
             else:
@@ -680,7 +716,7 @@ class ProjectManagerDialog(QDialog):
                 inp.blockSignals(block)
 
     def add_right_candidate(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select Right Text", "", "Text (*.txt)")
+        path, _ = QFileDialog.getOpenFileName(self, self._text("select_right"), "", self._text("text_filter"))
         if not path:
             return
         item = QListWidgetItem(os.path.basename(path) or path)
@@ -696,7 +732,7 @@ class ProjectManagerDialog(QDialog):
         self.save_current_project()
 
     def add_project(self):
-        name, ok = QInputDialog.getText(self, "New Project", "Project Name:")
+        name, ok = QInputDialog.getText(self, self._text("new_project"), self._text("project_name"))
         if ok and name:
             if self.config_manager.create_project(name):
                 self.refresh_project_list()
@@ -704,16 +740,16 @@ class ProjectManagerDialog(QDialog):
                 if items:
                     self.list_projects.setCurrentItem(items[0])
             else:
-                QMessageBox.warning(self, "Error", "Project name exists or invalid")
+                QMessageBox.warning(self, self._text("error"), self._text("name_invalid"))
 
     def delete_project(self):
         row = self.list_projects.currentRow()
         if row < 0: return
         name = self.list_projects.item(row).text()
         
-        ret = QMessageBox.question(self, "Delete", f"Delete project '{name}'?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        ret = QMessageBox.question(self, self._text("delete_project"), self._text("confirm_delete", name=name), QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if ret == QMessageBox.StandardButton.Yes:
             if self.config_manager.delete_project(name):
                 self.refresh_project_list()
             else:
-                QMessageBox.warning(self, "Error", "Cannot delete the last project")
+                QMessageBox.warning(self, self._text("error"), self._text("cannot_delete_last"))

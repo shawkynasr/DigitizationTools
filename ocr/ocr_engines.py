@@ -172,16 +172,134 @@ def result_label_from_suffix(suffix: str) -> str:
     return suffix
 
 
+OCR_CATEGORY_OPTIONS = (
+    ("text", "正文"),
+    ("title", "标题"),
+    ("image", "图片"),
+    ("table", "表格"),
+    ("formula", "公式"),
+    ("chart", "图表"),
+    ("header", "页眉"),
+    ("footer", "页脚"),
+    ("page_number", "页码"),
+    ("caption", "图注"),
+    ("list", "列表"),
+    ("reference", "引用"),
+    ("code", "代码"),
+    ("stamp", "印章"),
+)
+
+OCR_CATEGORY_ALIASES = {
+    "text": {
+        "text", "paragraph", "body", "content", "plain_text", "ocr_text",
+        "vertical_text", "generaltext", "general_text", "quark",
+    },
+    "title": {
+        "title", "heading", "doc_title", "document_title", "paragraph_title",
+        "section_title", "subtitle",
+    },
+    "image": {
+        "image", "img", "illustration", "figure", "picture", "photo",
+        "photograph", "graphic",
+    },
+    "table": {"table", "grid", "spreadsheet"},
+    "formula": {
+        "formula", "equation", "printedformula", "writtenformula",
+        "printed_formula", "written_formula", "inline_formula",
+        "display_formula", "isolate_formula", "interline_equation",
+    },
+    "chart": {"chart", "graph", "diagram"},
+    "header": {"header", "page_header", "running_header"},
+    "footer": {"footer", "page_footer", "running_footer"},
+    "page_number": {"page_number", "page_num", "pagenumber", "pageindex"},
+    "caption": {
+        "caption", "image_caption", "figure_caption", "table_caption",
+        "figure_title", "table_title",
+    },
+    "list": {"list", "list_item", "bullet", "ordered_list", "unordered_list"},
+    "reference": {"reference", "references", "bibliography", "citation"},
+    "code": {"code", "code_block", "algorithm"},
+    "stamp": {"stamp", "seal"},
+}
+
+_OCR_ALIAS_TO_CATEGORY = {
+    alias: category
+    for category, aliases in OCR_CATEGORY_ALIASES.items()
+    for alias in aliases
+}
+
+
+def canonical_ocr_category(label: str, engine_id: str = "") -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(label or "text").strip().lower()).strip("_")
+    compact = normalized.replace("_", "")
+    category = _OCR_ALIAS_TO_CATEGORY.get(normalized) or _OCR_ALIAS_TO_CATEGORY.get(compact)
+    if category:
+        return category
+
+    fuzzy_markers = (
+        ("formula", ("formula", "equation")),
+        ("image", ("image", "illustration", "figure", "picture", "photo")),
+        ("table", ("table", "grid")),
+        ("chart", ("chart", "graph", "diagram")),
+        ("page_number", ("pagenumber", "pageindex")),
+        ("header", ("header",)),
+        ("footer", ("footer",)),
+        ("caption", ("caption",)),
+        ("title", ("title", "heading")),
+        ("list", ("listitem", "bullet")),
+        ("reference", ("reference", "bibliography", "citation")),
+        ("code", ("code", "algorithm")),
+        ("stamp", ("stamp", "seal")),
+    )
+    for unified, markers in fuzzy_markers:
+        if any(marker in compact for marker in markers):
+            return unified
+    return normalized or "text"
+
+
+def excluded_categories(global_config: dict) -> set[str]:
+    configured = global_config.get("ocr_excluded_categories")
+    if configured is None:
+        configured = global_config.get(
+            "ocr_excluded_labels",
+            "image,table,formula,Illustration,PrintedFormula,WrittenFormula",
+        )
+    if isinstance(configured, str):
+        values = configured.replace("，", ",").split(",")
+    else:
+        values = configured or ()
+    return {
+        canonical_ocr_category(value)
+        for value in values
+        if str(value).strip()
+    }
+
+
 def excluded_labels(global_config: dict) -> set[str]:
-    raw = global_config.get("ocr_excluded_labels", "image,table,formula")
-    return {x.strip().lower() for x in re.split(r"[,，\s]+", raw or "") if x.strip()}
+    """Compatibility alias for older callers."""
+    return excluded_categories(global_config)
 
 
 def should_keep_label(label: str, global_config: dict) -> bool:
-    label = (label or "text").lower()
-    excluded = excluded_labels(global_config)
-    return label not in excluded
+    return canonical_ocr_category(label) not in excluded_categories(global_config)
 
+
+def _filter_normalized_blocks(blocks, global_config: dict, engine_id: str = "") -> list[dict]:
+    """Apply current unified category exclusions to normalized blocks."""
+    filtered = []
+    for block in blocks or ():
+        if not isinstance(block, dict):
+            continue
+        label = block.get("block_label") or block.get("label") or block.get("type") or "text"
+        category = canonical_ocr_category(str(label), engine_id)
+        if category in excluded_categories(global_config):
+            continue
+        copied = dict(block)
+        copied["ocr_category"] = category
+        if engine_id == "mineru" and copied.get("bbox"):
+            copied.setdefault("bbox_coordinate_type", "mineru_page_1000")
+        filtered.append(copied)
+    return filtered
 
 def points_to_bbox(points, page_size=None):
     if not points:
@@ -208,31 +326,36 @@ def normalize_ocr_result(raw, engine_id: str, global_config: dict | None = None)
     global_config = global_config or {}
     engine_id = canonical_engine_id(engine_id)
 
+    if (
+        isinstance(raw, dict)
+        and "raw" in raw
+        and ("__engine" in raw or "__model" in raw)
+    ):
+        stored_engine = canonical_engine_id(raw.get("__engine") or engine_id)
+        return normalize_ocr_result(raw.get("raw"), stored_engine, global_config)
+
     if isinstance(raw, dict) and isinstance(raw.get("__normalized_blocks"), list):
-        if engine_id == "mineru":
-            for block in raw["__normalized_blocks"]:
-                if isinstance(block, dict) and block.get("bbox"):
-                    block.setdefault("bbox_coordinate_type", "mineru_page_1000")
-        if engine_id == "textin":
-            return raw["__normalized_blocks"]
-        return raw["__normalized_blocks"]
+        stored_engine = canonical_engine_id(raw.get("__engine") or engine_id)
+        # Re-normalize legacy wrappers from raw data so changed exclusions take effect.
+        if raw.get("raw") is not None:
+            return normalize_ocr_result(raw["raw"], stored_engine, global_config)
+        return _filter_normalized_blocks(raw["__normalized_blocks"], global_config, stored_engine)
 
     if isinstance(raw, list):
-        return normalize_paddle(raw, global_config)
-
-    if not isinstance(raw, dict):
+        normalized = normalize_paddle(raw, global_config)
+    elif not isinstance(raw, dict):
         return []
-
-    if engine_id == "textin":
-        return normalize_textin(raw, global_config)
-    if engine_id == "mineru":
-        return normalize_mineru(raw, global_config)
-    if engine_id == "quark":
-        return normalize_quark(raw, global_config)
-    if engine_id == "chrome_lens":
-        return normalize_chrome_lens(raw, global_config)
-    return normalize_paddle(raw, global_config)
-
+    elif engine_id == "textin":
+        normalized = normalize_textin(raw, global_config)
+    elif engine_id == "mineru":
+        normalized = normalize_mineru(raw, global_config)
+    elif engine_id == "quark":
+        normalized = normalize_quark(raw, global_config)
+    elif engine_id == "chrome_lens":
+        normalized = normalize_chrome_lens(raw, global_config)
+    else:
+        normalized = normalize_paddle(raw, global_config)
+    return _filter_normalized_blocks(normalized, global_config, engine_id)
 
 def normalize_paddle(raw, global_config):
     out = []
@@ -667,18 +790,34 @@ def _download_mineru_zip_result(zip_url, polled_result, config):
         return polled_result
     zip_resp = requests.get(zip_url, timeout=int(config.get("timeout", 120)))
     zip_resp.raise_for_status()
-    payload = {"mineru_result": polled_result, "content_list": [], "markdown": ""}
+    payload = {
+        "mineru_result": polled_result,
+        "content_list": [],
+        "markdown": "",
+        "images": {},
+    }
+    image_output_dir = config.get("_image_output_dir")
+    image_extensions = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+
     with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
         for name in zf.namelist():
             lower = name.lower()
             if lower.endswith("_content_list.json") or lower.endswith("content_list.json"):
-                with zf.open(name) as f:
-                    payload["content_list"] = json.loads(f.read().decode("utf-8"))
+                with zf.open(name) as source:
+                    payload["content_list"] = json.loads(source.read().decode("utf-8"))
             elif lower.endswith("full.md"):
-                with zf.open(name) as f:
-                    payload["markdown"] = f.read().decode("utf-8")
+                with zf.open(name) as source:
+                    payload["markdown"] = source.read().decode("utf-8")
+            elif image_output_dir and os.path.splitext(lower)[1] in image_extensions:
+                safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", name.replace(chr(92), "/")).strip("._")
+                if not safe_name:
+                    safe_name = f"image_{len(payload['images']) + 1}.png"
+                os.makedirs(image_output_dir, exist_ok=True)
+                local_path = os.path.join(image_output_dir, safe_name)
+                with zf.open(name) as source, open(local_path, "wb") as target:
+                    target.write(source.read())
+                payload["images"][name] = os.path.abspath(local_path)
     return payload
-
 
 def run_mineru_agent_legacy(img_bytes: bytes, config: dict, filename="page.jpg") -> dict:
     create_url = config.get("endpoint", "https://mineru.net/api/v1/agent/parse/file")

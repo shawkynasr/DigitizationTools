@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QTextEdit, QPlainTextEdit, QLabel, QPushButton, QSplitter, QFileDialog,
                              QMessageBox, QGraphicsView, QGraphicsScene,
                              QGraphicsRectItem, QLineEdit, QSpinBox, QToolBar, QComboBox, QCheckBox,
-                             QDialog, QListWidget, QStackedWidget)
+                             QDialog, QListWidget, QStackedWidget, QRadioButton, QDialogButtonBox)
 from PyQt6.QtGui import (QTextCursor, QColor, QSyntaxHighlighter, QTextCharFormat, QTextFormat,
                          QAction, QPixmap, QImage, QPainter, QPen, QFont, QTextOption)
 from PyQt6.QtWidgets import QProgressBar
@@ -95,6 +95,9 @@ DEFAULT_GLOBAL_CONFIG = {
     "ocr_retry_count": 3,
     "ocr_concurrent_tasks": 2,
     "ocr_engine": "paddleocr",
+    "ocr_excluded_categories": [
+        "image", "table", "formula", "chart", "header", "footer", "page_number"
+    ],
     "find_history": [],
     "replace_history": [],
     "shortcuts_alt": [""] * 10,
@@ -184,6 +187,14 @@ class ConfigManager:
                     self.data["projects"] = [DEFAULT_PROJECT_CONFIG.copy()]
                 if "active_project" not in self.data:
                     self.data["active_project"] = self.data["projects"][0]["name"]
+                category_config = self.data["global"]
+                category_version = int(category_config.get("ocr_category_defaults_version", 1))
+                current_categories = set(category_config.get("ocr_excluded_categories") or [])
+                if category_version < 2:
+                    if current_categories == {"image", "table", "formula"}:
+                        current_categories.update({"chart", "header", "footer", "page_number"})
+                        category_config["ocr_excluded_categories"] = sorted(current_categories)
+                    category_config["ocr_category_defaults_version"] = 2
                 if self.data.get("global", {}).get("ocr_engine") == "remote":
                     self.data["global"]["ocr_engine"] = "paddleocr"
                     
@@ -1380,6 +1391,7 @@ class MainWindow(QMainWindow):
         self.lbl_ocr_model.setText(self.get_text("lbl_model"))
         self.btn_ocr_cur.setText(self.get_text("btn_ocr_cur"))
         self.btn_batch.setText(self.get_text("btn_ocr_batch"))
+        self.btn_ocr_pages.setText(self.get_text("btn_ocr_pages"))
                 
     def _get_focused_editor(self):
         """Return the last active editable source, rendered, or revision surface."""
@@ -1637,6 +1649,9 @@ class MainWindow(QMainWindow):
         self.btn_batch = QPushButton("OCR所有缺失页面")
         self.btn_batch.clicked.connect(self.run_batch_ocr)
         toolbar.addWidget(self.btn_batch)
+        self.btn_ocr_pages = QPushButton("OCR指定页码")
+        self.btn_ocr_pages.clicked.connect(self.run_selected_pages_ocr)
+        toolbar.addWidget(self.btn_ocr_pages)
         self.refresh_ocr_engine_combo()
 
         # Export Menu (Moved to Menu Bar)
@@ -1652,16 +1667,16 @@ class MainWindow(QMainWindow):
         
         self.menu_export.addSeparator()
         
-        self.act_exp_ocr_all = QAction("导出所有页面OCR文本", self)
+        self.act_exp_ocr_all = QAction("导出页面OCR文本", self)
         self.act_exp_ocr_all.triggered.connect(self.exporter.export_all_ocr_txt)
         self.menu_export.addAction(self.act_exp_ocr_all)
         
         # New Markdown Exports
-        self.act_exp_md_all = QAction("导出所有为Markdown", self)
+        self.act_exp_md_all = QAction("导出Markdown", self)
         self.act_exp_md_all.triggered.connect(lambda: self.exporter.export_all_markdown(with_images=False))
         self.menu_export.addAction(self.act_exp_md_all)
         
-        self.act_exp_md_img_all = QAction("导出所有为Markdown+图片", self)
+        self.act_exp_md_img_all = QAction("导出Markdown+图片", self)
         self.act_exp_md_img_all.triggered.connect(lambda: self.exporter.export_all_markdown(with_images=True))
         self.menu_export.addAction(self.act_exp_md_img_all)
         
@@ -3529,6 +3544,152 @@ class MainWindow(QMainWindow):
             if pages:
                 self.save_right_data(idx, force=True)
 
+    @staticmethod
+    def _parse_ocr_page_spec(spec):
+        pages = set()
+        normalized = (spec or "").replace("，", ",").replace("–", "-").replace("—", "-")
+        for token in normalized.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            single = re.fullmatch(r"[0-9]+", token)
+            page_range = re.fullmatch(r"([0-9]+)[ ]*-[ ]*([0-9]+)", token)
+            if single:
+                pages.add(int(token))
+            elif page_range:
+                first, last = map(int, page_range.groups())
+                if first > last:
+                    raise ValueError(f"页码范围起点大于终点：{token}")
+                pages.update(range(first, last + 1))
+            else:
+                raise ValueError(f"无法识别的页码：{token}")
+        if not pages:
+            raise ValueError("请输入至少一个页码。")
+        return sorted(pages)
+
+    def run_selected_pages_ocr(self):
+        if hasattr(self, "ocr_thread") and self.ocr_thread and self.ocr_thread.isRunning():
+            QMessageBox.information(self, "OCR", "已有 OCR 任务正在运行。")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("OCR 指定页码")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("页码或范围（例如：1-10,11-14）："))
+        page_input = QLineEdit(dialog)
+        page_input.setPlaceholderText("1-10,11-14")
+        layout.addWidget(page_input)
+
+        layout.addWidget(QLabel("遇到已有 OCR 结果："))
+        skip_existing = QRadioButton("跳过已有结果", dialog)
+        overwrite_existing = QRadioButton("重新 OCR 并覆盖", dialog)
+        skip_existing.setChecked(True)
+        layout.addWidget(skip_existing)
+        layout.addWidget(overwrite_existing)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=dialog,
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        page_input.setFocus()
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            pages = self._parse_ocr_page_spec(page_input.text())
+        except ValueError as exc:
+            QMessageBox.warning(self, "页码格式错误", str(exc))
+            return
+
+        project_start = int(self.project_config.get("start_page", 1))
+        project_end = int(self.project_config.get("end_page", project_start))
+        outside = [page for page in pages if page < project_start or page > project_end]
+        if outside:
+            QMessageBox.warning(
+                self,
+                "页码超出范围",
+                f"项目页码范围为 {project_start}-{project_end}，以下页码无效："
+                + ", ".join(map(str, outside)),
+            )
+            return
+
+        engine = canonical_engine_id(self.global_config.get("ocr_engine", "remote"))
+        if self.combo_ocr_engine.currentData() is None:
+            QMessageBox.warning(self, "Config", "No configured OCR engine is available.")
+            return
+        if engine == PADDLE_ENGINE_ID:
+            if not self.global_config.get("ocr_api_token"):
+                QMessageBox.warning(self, "Config", "Missing Token for Remote OCR (set in Settings)")
+                return
+        elif engine == "textin":
+            config = self.global_config.get("ocr_engines", {}).get("textin", {})
+            if not config.get("app_id") or not config.get("secret_code"):
+                QMessageBox.warning(self, "Config", "Missing Textin App ID or Secret Code")
+                return
+        elif engine == "quark":
+            config = self.global_config.get("ocr_engines", {}).get("quark", {})
+            if not config.get("client_id") or not config.get("client_secret"):
+                QMessageBox.warning(self, "Config", "Missing Quark Client ID or Client Secret")
+                return
+        elif engine == "mineru":
+            config = self.global_config.get("ocr_engines", {}).get("mineru", {})
+            if not config.get("token"):
+                QMessageBox.warning(self, "Config", "Missing MinerU Token")
+                return
+        elif engine == "local":
+            if not any(item["id"] == "local" for item in get_available_engines()):
+                QMessageBox.warning(self, "Config", "Local OCR module missing")
+                return
+
+        from ocr.ocr_engines import get_result_path, get_legacy_result_paths
+
+        save_dir = self.project_config.get("ocr_json_path", "ocr_results")
+        page_offset = self.project_config.get("page_offset", 0)
+        selected_pages = []
+        skipped_existing_count = 0
+        for page in pages:
+            real_page = page + page_offset
+            result_path = get_result_path(save_dir, real_page, engine, self.global_config)
+            legacy_paths = get_legacy_result_paths(save_dir, real_page) if engine == PADDLE_ENGINE_ID else []
+            exists = os.path.exists(result_path) or any(os.path.exists(path) for path in legacy_paths)
+            if skip_existing.isChecked() and exists:
+                skipped_existing_count += 1
+                continue
+            selected_pages.append(page)
+
+        available_pages = []
+        missing_image_pages = []
+        for page in selected_pages:
+            real_page = page + page_offset
+            if get_page_image(self.doc, self.project_config.get("image_dir"), real_page):
+                available_pages.append(page)
+            else:
+                missing_image_pages.append(page)
+
+        if not available_pages:
+            details = []
+            if skipped_existing_count:
+                details.append(f"已跳过 {skipped_existing_count} 个已有结果")
+            if missing_image_pages:
+                details.append(f"{len(missing_image_pages)} 页没有图片")
+            QMessageBox.information(self, "OCR", "没有需要处理的页面。" + ("；".join(details) if details else ""))
+            return
+
+        status_parts = [f"将 OCR {len(available_pages)} 页"]
+        if skipped_existing_count:
+            status_parts.append(f"跳过 {skipped_existing_count} 个已有结果")
+        if missing_image_pages:
+            status_parts.append(f"跳过 {len(missing_image_pages)} 个无图片页")
+        self.statusBar().showMessage("；".join(status_parts), 6000)
+
+        self.btn_batch.setText("Cancel OCR")
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, len(available_pages))
+        self.progress_bar.setValue(0)
+        self.start_ocr_thread("batch", available_pages)
     def run_batch_ocr(self):
         """批量 OCR / Cancel"""
         # Toggle Logic: Cancel
@@ -3736,6 +3897,7 @@ class MainWindow(QMainWindow):
         self.combo_ocr_engine.blockSignals(False)
         self.btn_ocr_cur.setEnabled(bool(available_engines))
         self.btn_batch.setEnabled(bool(available_engines))
+        self.btn_ocr_pages.setEnabled(bool(available_engines))
         self.refresh_ocr_model_combo(self.combo_ocr_engine.currentData())
 
     def refresh_ocr_model_combo(self, engine):

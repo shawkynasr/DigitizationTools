@@ -33,7 +33,6 @@ from ocr.ocr_engines import (
     PADDLE_ENGINE_ID,
     canonical_engine_id,
     get_result_path,
-    normalize_ocr_result,
     run_mineru_agent,
     run_quark,
     run_textin,
@@ -187,11 +186,9 @@ class OCRWorker(QThread):
                             os.remove(temp_path)
 
                     json_path = get_result_path(save_dir, real_page_num, self.engine, self.global_config)
-                    normalized = normalize_ocr_result(result, self.engine, self.global_config)
                     payload = {
                         "__engine": self.engine,
                         "__model": "PaddleOCR Local",
-                        "__normalized_blocks": normalized,
                         "raw": result,
                     }
                     with open(json_path, "w", encoding='utf8') as jf:
@@ -257,11 +254,9 @@ class OCRWorker(QThread):
                     try:
                         result = self._run_engine(img_bytes, token, model, page_num)
                         json_path = get_result_path(save_dir, real_page_num, self.engine, self.global_config)
-                        normalized = normalize_ocr_result(result, self.engine, self.global_config)
                         payload = {
                             "__engine": self.engine,
                             "__model": model if self.engine == PADDLE_ENGINE_ID else self.engine,
-                            "__normalized_blocks": normalized,
                             "raw": result,
                         }
                         with open(json_path, "w", encoding='utf8') as jf:
@@ -341,10 +336,16 @@ class OCRWorker(QThread):
         if self.engine == PADDLE_ENGINE_ID:
             return self._run_v2_remote(img_bytes, token, model, page_num)
         engine_configs = self.global_config.get("ocr_engines", {})
-        config = engine_configs.get(self.engine, {})
+        config = dict(engine_configs.get(self.engine, {}))
         if self.engine == "textin":
             return run_textin(img_bytes, config)
         if self.engine == "mineru":
+            real_page_num = page_num + self.project_config.get("page_offset", 0)
+            config["_image_output_dir"] = os.path.join(
+                self.project_config.get("ocr_json_path", "ocr_results"),
+                "mineru_images",
+                f"page_{real_page_num}",
+            )
             return run_mineru_agent(
                 img_bytes,
                 config,

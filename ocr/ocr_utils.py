@@ -3,13 +3,14 @@ import json
 import difflib
 import re
 import fitz
+from PyQt6.QtCore import QBuffer, QIODevice
 from PyQt6.QtGui import QImage, QPainter, QColor
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
 
 
-def _normalized_pdf_image_bytes(doc, xref, base_image):
-    """Return extracted bytes with PDF stencil/decode polarity applied."""
+def normalize_extracted_pdf_image(doc, xref, base_image):
+    """Apply PDF image polarity and preserve bilevel data as a 1-bit PNG."""
     image_bytes = base_image.get("image")
     if not image_bytes:
         return None
@@ -23,17 +24,25 @@ def _normalized_pdf_image_bytes(doc, xref, base_image):
     reverse_decode = bool(
         re.search(r"/Decode\s*\[\s*1(?:\.0+)?\s+0(?:\.0+)?\s*\]", image_object)
     )
-    if not is_stencil and not reverse_decode:
+    is_bilevel = int(base_image.get("bpc") or 0) == 1
+    if not is_stencil and not reverse_decode and not is_bilevel:
         return image_bytes
 
     try:
-        # ImageMask xrefs remain stencil pixmaps and ignore invert_irect().
-        # Decode the extracted image first to obtain a grayscale colorspace.
-        pixmap = fitz.Pixmap(image_bytes)
-        if pixmap.n - pixmap.alpha >= 4:
-            pixmap = fitz.Pixmap(fitz.csRGB, pixmap)
-        pixmap.invert_irect()
-        return pixmap.tobytes("png")
+        image = QImage.fromData(image_bytes)
+        if image.isNull():
+            return image_bytes
+        if is_stencil or reverse_decode:
+            image.invertPixels()
+        if is_bilevel:
+            image = image.convertToFormat(QImage.Format.Format_Mono)
+
+        buffer = QBuffer()
+        if not buffer.open(QIODevice.OpenModeFlag.WriteOnly):
+            return image_bytes
+        if not image.save(buffer, "PNG"):
+            return image_bytes
+        return bytes(buffer.data())
     except Exception:
         return image_bytes
 
@@ -96,7 +105,7 @@ def get_page_image(doc, img_dir, real_page_num, allow_pdf_render=True):
                 if len(images) == 1:
                     xref = images[0][0]
                     base_image = doc.extract_image(xref)
-                    img_bytes = _normalized_pdf_image_bytes(doc, xref, base_image)
+                    img_bytes = normalize_extracted_pdf_image(doc, xref, base_image)
                 elif allow_pdf_render:
                     # Fallback High DPI Render
                     pix = page.get_pixmap(matrix=fitz.Matrix(3.0, 3.0))

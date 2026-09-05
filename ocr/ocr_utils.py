@@ -1,10 +1,41 @@
 import os
 import json
 import difflib
+import re
 import fitz
 from PyQt6.QtGui import QImage, QPainter, QColor
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
+
+
+def _normalized_pdf_image_bytes(doc, xref, base_image):
+    """Return extracted bytes with PDF stencil/decode polarity applied."""
+    image_bytes = base_image.get("image")
+    if not image_bytes:
+        return None
+
+    try:
+        image_object = doc.xref_object(xref, compressed=True)
+    except Exception:
+        image_object = ""
+
+    is_stencil = bool(re.search(r"/ImageMask\s+true\b", image_object))
+    reverse_decode = bool(
+        re.search(r"/Decode\s*\[\s*1(?:\.0+)?\s+0(?:\.0+)?\s*\]", image_object)
+    )
+    if not is_stencil and not reverse_decode:
+        return image_bytes
+
+    try:
+        # ImageMask xrefs remain stencil pixmaps and ignore invert_irect().
+        # Decode the extracted image first to obtain a grayscale colorspace.
+        pixmap = fitz.Pixmap(image_bytes)
+        if pixmap.n - pixmap.alpha >= 4:
+            pixmap = fitz.Pixmap(fitz.csRGB, pixmap)
+        pixmap.invert_irect()
+        return pixmap.tobytes("png")
+    except Exception:
+        return image_bytes
 
 
 def get_page_image_path(img_dir, real_page_num):
@@ -65,7 +96,7 @@ def get_page_image(doc, img_dir, real_page_num, allow_pdf_render=True):
                 if len(images) == 1:
                     xref = images[0][0]
                     base_image = doc.extract_image(xref)
-                    img_bytes = base_image["image"]
+                    img_bytes = _normalized_pdf_image_bytes(doc, xref, base_image)
                 elif allow_pdf_render:
                     # Fallback High DPI Render
                     pix = page.get_pixmap(matrix=fitz.Matrix(3.0, 3.0))

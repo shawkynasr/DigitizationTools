@@ -1,7 +1,6 @@
 import os
 import json
 import time
-import threading
 import requests
 import re
 import fitz
@@ -206,46 +205,12 @@ class OCRWorker(QThread):
 
         # ------ Remote engine: concurrent with retry ------
         else:
-            # Pre-load all images on the main doc thread (fitz is not thread-safe)
-            page_images = {}  # page_num -> img_bytes
-            skipped_no_image = []
-            for page_num in self.page_list:
-                real_page_num = page_num + self.project_config.get("page_offset", 0)
-                img_bytes = get_page_image(doc, self.project_config.get('image_dir'), real_page_num)
-                if img_bytes:
-                    page_images[page_num] = img_bytes
-                else:
-                    skipped_no_image.append(page_num)
+            done_count = 0
+            prepared_count = 0
 
-            if skipped_no_image:
-                for page_num in skipped_no_image:
-                    self.progress.emit(f"Page {page_num} skipped: no image")
-                if self.mode == 'single':
-                    self.finished.emit(False, f"No image found for page {skipped_no_image[0]}")
-                    if doc:
-                        doc.close()
-                    return
-
-            if not page_images:
-                if doc:
-                    doc.close()
-                self.finished.emit(False, "No page images found. OCR not submitted.")
-                return
-
-            counter_lock = threading.Lock()
-            done_count = len(skipped_no_image)
-            if skipped_no_image:
-                self.page_done.emit(done_count, total)
-
-            def process_page(page_num):
+            def process_page(page_num, img_bytes):
                 """Worker function executed in thread pool."""
                 real_page_num = page_num + self.project_config.get("page_offset", 0)
-                img_bytes = page_images.get(page_num)
-
-                if not img_bytes:
-                    if self.mode == 'single':
-                        raise Exception(f"No image found for page {page_num}")
-                    return False, page_num, "no image"
 
                 last_exc = None
                 for attempt in range(retry_count):
@@ -278,52 +243,80 @@ class OCRWorker(QThread):
 
                 return False, page_num, str(last_exc)
 
-            # Run concurrent tasks
-            submit_pages = list(page_images.keys())
-            effective_workers = min(concurrent, len(submit_pages)) if submit_pages else 1
+            # PyMuPDF documents are not thread-safe, so page extraction stays on
+            # this QThread. Keep only one concurrency-sized image batch in memory.
+            effective_workers = max(1, min(concurrent, total))
             self._executor = ThreadPoolExecutor(max_workers=effective_workers)
-            futures = {
-                self._executor.submit(process_page, pn): pn
-                for pn in submit_pages
-            }
 
             try:
-                for future in as_completed(futures):
+                for batch_start in range(0, total, effective_workers):
                     if not self._is_running:
                         break
-                    pn = futures[future]
-                    try:
-                        ok, page_num, err = future.result()
-                    except Exception as exc:
-                        ok, page_num, err = False, pn, str(exc)
-
-                    with counter_lock:
-                        done_count += 1
-                        current_done = done_count
-
-                    if ok:
-                        success_count += 1
-                        self.page_done.emit(current_done, total)
+                    futures = {}
+                    for page_num in self.page_list[
+                        batch_start:batch_start + effective_workers
+                    ]:
+                        if not self._is_running:
+                            break
                         self.progress.emit(
-                            f"Page {page_num} done ✓ ({current_done}/{total})"
+                            f"Preparing page {page_num} ({done_count + len(futures) + 1}/{total})..."
                         )
-                    else:
-                        self.page_done.emit(current_done, total)
-                        if err == "cancelled":
-                            self.progress.emit(f"Page {page_num} cancelled.")
-                        else:
-                            self.progress.emit(
-                                f"Page {page_num} FAILED after {retry_count} attempts: {err}"
-                            )
+                        real_page_num = page_num + self.project_config.get("page_offset", 0)
+                        img_bytes = get_page_image(
+                            doc, self.project_config.get('image_dir'), real_page_num
+                        )
+                        if not img_bytes:
+                            done_count += 1
+                            self.page_done.emit(done_count, total)
+                            self.progress.emit(f"Page {page_num} skipped: no image")
                             if self.mode == 'single':
-                                self._executor.shutdown(wait=False)
-                                self.finished.emit(False, err or "Remote OCR failed")
+                                self.finished.emit(False, f"No image found for page {page_num}")
                                 if doc:
                                     doc.close()
                                 return
+                            continue
+                        prepared_count += 1
+                        future = self._executor.submit(process_page, page_num, img_bytes)
+                        futures[future] = page_num
+
+                    for future in as_completed(futures):
+                        if not self._is_running:
+                            break
+                        pn = futures[future]
+                        try:
+                            ok, page_num, err = future.result()
+                        except Exception as exc:
+                            ok, page_num, err = False, pn, str(exc)
+
+                        done_count += 1
+                        if ok:
+                            success_count += 1
+                            self.page_done.emit(done_count, total)
+                            self.progress.emit(
+                                f"Page {page_num} done ✓ ({done_count}/{total})"
+                            )
+                        else:
+                            self.page_done.emit(done_count, total)
+                            if err == "cancelled":
+                                self.progress.emit(f"Page {page_num} cancelled.")
+                            else:
+                                self.progress.emit(
+                                    f"Page {page_num} FAILED after {retry_count} attempts: {err}"
+                                )
+                                if self.mode == 'single':
+                                    self.finished.emit(False, err or "Remote OCR failed")
+                                    if doc:
+                                        doc.close()
+                                    return
             finally:
                 self._executor.shutdown(wait=False)
                 self._executor = None
+
+            if self._is_running and prepared_count == 0:
+                if doc:
+                    doc.close()
+                self.finished.emit(False, "No page images found. OCR not submitted.")
+                return
 
         if doc:
             doc.close()

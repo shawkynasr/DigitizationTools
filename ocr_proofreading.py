@@ -2412,23 +2412,10 @@ class MainWindow(QMainWindow):
     def get_best_page_image_bytes(self, doc, page_num):
         """Extract High-Res or Raw image from PDF"""
         try:
-             real_page_num = page_num + self.project_config.get('page_offset', 0)
-             if 0 < real_page_num <= len(doc):
-                 page = doc[real_page_num - 1]
-                 
-                 # 1. Try Extract Raw Image (scanned PDF)
-                 try:
-                     images = page.get_images()
-                     if len(images) == 1:
-                         xref = images[0][0]
-                         base_image = doc.extract_image(xref)
-                         return base_image["image"]
-                 except: pass # some implementation might fail
-                 
-                 # 2. Fallback: High DPI Render
-                 pix = page.get_pixmap(matrix=fitz.Matrix(3.0, 3.0))
-                 return pix.tobytes("png")
-        except: pass
+            real_page_num = page_num + self.project_config.get('page_offset', 0)
+            return get_page_image(doc, None, real_page_num)
+        except Exception:
+            pass
         return None
 
     def get_page_pixmap(self, page_num):
@@ -3687,35 +3674,24 @@ class MainWindow(QMainWindow):
                 continue
             selected_pages.append(page)
 
-        available_pages = []
-        missing_image_pages = []
-        for page in selected_pages:
-            real_page = page + page_offset
-            if get_page_image(self.doc, self.project_config.get("image_dir"), real_page):
-                available_pages.append(page)
-            else:
-                missing_image_pages.append(page)
-
-        if not available_pages:
+        if not selected_pages:
             details = []
             if skipped_existing_count:
                 details.append(f"已跳过 {skipped_existing_count} 个已有结果")
-            if missing_image_pages:
-                details.append(f"{len(missing_image_pages)} 页没有图片")
             QMessageBox.information(self, "OCR", "没有需要处理的页面。" + ("；".join(details) if details else ""))
             return
 
-        status_parts = [f"将 OCR {len(available_pages)} 页"]
+        # Resolve PDF images in OCRWorker so selecting thousands of pages never
+        # decodes or renders the entire range on the GUI thread.
+        status_parts = [f"将 OCR {len(selected_pages)} 页"]
         if skipped_existing_count:
             status_parts.append(f"跳过 {skipped_existing_count} 个已有结果")
-        if missing_image_pages:
-            status_parts.append(f"跳过 {len(missing_image_pages)} 个无图片页")
         self.statusBar().showMessage("；".join(status_parts), 6000)
 
         self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, len(available_pages))
+        self.progress_bar.setRange(0, len(selected_pages))
         self.progress_bar.setValue(0)
-        self.start_ocr_thread("batch", available_pages)
+        self.start_ocr_thread("batch", selected_pages)
     def run_batch_ocr(self):
         """批量 OCR / Cancel"""
         if self._ocr_task_running():
@@ -3772,28 +3748,12 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Info", "No missing OCR pages found.")
             return
 
-        ocr_pages = []
-        skipped_pages = []
-        for p in missing_pages:
-            real_page_num = p + self.project_config.get("page_offset", 0)
-            if get_page_image(self.doc, self.project_config.get('image_dir'), real_page_num):
-                ocr_pages.append(p)
-            else:
-                skipped_pages.append(p)
-
-        if skipped_pages:
-            self.statusBar().showMessage(f"Skipped {len(skipped_pages)} pages without images.")
-
-        if not ocr_pages:
-            QMessageBox.information(self, "Info", "No page images found. OCR task was not started.")
-            return
-            
-        # Direct Start with Cancel Option
+        # Image availability is checked by the background worker page by page.
         self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, len(ocr_pages))
+        self.progress_bar.setRange(0, len(missing_pages))
         self.progress_bar.setValue(0)
         
-        self.start_ocr_thread('batch', ocr_pages)
+        self.start_ocr_thread('batch', missing_pages)
 
     def start_ocr_thread(self, mode, pages):
         # OCRWorker(mode, pages, project_config, global_config, engine, pdf_path)
@@ -4003,30 +3963,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Config", "No configured OCR engine is available.")
             return
 
-        real_page_num = page_num + self.project_config.get("page_offset", 0)
-        doc = self.doc
-        should_close_doc = False
-        if not doc:
-            pdf_path = self.project_config.get('pdf_path')
-            if pdf_path and os.path.exists(pdf_path):
-                try:
-                    doc = fitz.open(pdf_path)
-                    should_close_doc = True
-                except Exception:
-                    doc = None
-        try:
-            if not get_page_image(
-                doc,
-                self.project_config.get('image_dir'),
-                real_page_num,
-            ):
-                QMessageBox.warning(self, "OCR", f"No image found for page {page_num}.")
-                return
-        finally:
-            if should_close_doc and doc:
-                doc.close()
-        
-        # Disable button?
+        # Resolve the image in OCRWorker to keep PDF decoding off the GUI thread.
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         self.start_ocr_thread('single', [page_num])
 

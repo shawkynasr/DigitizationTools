@@ -1,31 +1,58 @@
 import os
 import re
+import codecs
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QListWidget, 
                              QPushButton, QFormLayout, QComboBox, 
                              QDialogButtonBox, QFileDialog, QMessageBox)
 
 PAGE_PATTERN = re.compile(r"<(\d+)>")
 
+_INVISIBLE = "\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\ufeff"
+_MARKER_LINE = re.compile(rf"[\s{_INVISIBLE}]*<\s*(\d+)\s*>[\s{_INVISIBLE}]*")
+
+
+def _decode_text(raw: bytes) -> str:
+    if raw.startswith(codecs.BOM_UTF8):
+        return raw.decode("utf-8-sig")
+    if raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return raw.decode("utf-16")
+    for enc in ("utf-8", "cp1256"):          # UTF-8 first, then Windows Arabic
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 def read_text_to_pages(file_path: str) -> dict[int, str]:
     pages = {}
-    if not os.path.exists(file_path): 
+    if not os.path.exists(file_path):
+        print(f"File not found: {file_path}")
         return pages
     try:
+        with open(file_path, "rb") as f:
+            text = _decode_text(f.read())
+
+        lines = re.split(r"\r\n|\r|\n", text)
+        if lines and lines[-1] == "":        # same behaviour as iterating a file
+            lines.pop()
+
         current_page = None
         current_content = []
-        with open(file_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.rstrip("\n")
-                match = PAGE_PATTERN.fullmatch(line.strip())
-                if match:
-                    if current_page is not None:
-                        pages[current_page] = "\n".join(current_content)
-                    current_page = int(match.group(1))
-                    current_content = []
-                else:
-                    current_content.append(line)
-            if current_page is not None:
-                pages[current_page] = "\n".join(current_content)
+        for line in lines:
+            match = _MARKER_LINE.fullmatch(line)
+            if match:
+                if current_page is not None:
+                    pages[current_page] = "\n".join(current_content)
+                current_page = int(match.group(1))   # int() accepts ١٢٣ too
+                current_content = []
+            else:
+                current_content.append(line)
+        if current_page is not None:
+            pages[current_page] = "\n".join(current_content)
+
+        if not pages:
+            print(f"No page markers like <1> found in {file_path}")
     except Exception as e:
         print(f"Read error {file_path}: {e}")
     return pages

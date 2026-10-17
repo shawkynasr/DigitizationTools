@@ -4,53 +4,122 @@ on:
   push:
     branches: [ "main", "master" ]
     tags:
-      - 'v*' # 只有推送 v 开头的 tag 时才会发布 Release (如 v1.0.0)
+      - 'v*'
   pull_request:
     branches: [ "main", "master" ]
-  workflow_dispatch: # 允许手动触发
+  workflow_dispatch:
 
 permissions:
-  contents: write # 允许 GITHUB_TOKEN 创建 Release 并在其中包括文件
+  contents: write
 
 jobs:
   build:
-    runs-on: windows-latest
-    
-    steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
-    
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10' # 推荐使用稳定的 Python 版本
-        
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install pyinstaller PyQt6 PyMuPDF requests pykakasi "chrome-lens-py==3.4.5" "protobuf>=6.33.4,<7"
-        python -c "from chrome_lens_py import LensAPI; print('Chrome Lens dependency import passed')"
-        
-    - name: Build with PyInstaller
-      run: |
-        pyinstaller --noconfirm --onedir --windowed --name "OcrProofreadingTool" --additional-hooks-dir "packaging_hooks" --collect-data "pykakasi" "ocr_proofreading.py"
-        
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: OcrProofreadingTool-Windows
-        path: dist/OcrProofreadingTool/
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows-x64
+            os: windows-latest
+          - name: Linux-x64
+            os: ubuntu-latest
+          - name: macOS-Intel
+            os: macos-15-intel      # Intel, macOS 15
+          - name: macOS-ARM
+            os: macos-15            # Apple Silicon (arm64), macOS 15
 
-    - name: Zip for Release
-      if: startsWith(github.ref, 'refs/tags/')
-      run: |
-        Compress-Archive -Path dist\OcrProofreadingTool -DestinationPath OcrProofreadingTool-Windows.zip
-        
-    - name: Create GitHub Release
-      uses: softprops/action-gh-release@v2
-      if: startsWith(github.ref, 'refs/tags/')
-      with:
-        files: OcrProofreadingTool-Windows.zip
-        generate_release_notes: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Qt libraries PyInstaller needs to find when analysing PyQt6 on Linux
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libegl1 libgl1 libglib2.0-0 libdbus-1-3 libfontconfig1 \
+            libxkbcommon0 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 \
+            libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
+            libxcb-shape0 libxcb-xinerama0 libxcb-xkb1 libxcb-xfixes0
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller PyQt6 PyMuPDF requests pykakasi "chrome-lens-py==3.4.5" "protobuf>=6.33.4,<7"
+          python -c "from chrome_lens_py import LensAPI; print('Chrome Lens dependency import passed')"
+
+      - name: Build with PyInstaller
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          pyinstaller --noconfirm --onedir --windowed \
+            --name "OcrProofreadingTool" \
+            --additional-hooks-dir "packaging_hooks" \
+            --collect-data "pykakasi" \
+            "ocr_proofreading.py"
+
+      - name: List dist directory
+        run: ls -la dist
+
+      # Package per OS so permissions/symlinks (esp. the macOS .app) survive upload
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\OcrProofreadingTool -DestinationPath OcrProofreadingTool-${{ matrix.name }}.zip
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          tar -czf OcrProofreadingTool-${{ matrix.name }}.tar.gz -C dist OcrProofreadingTool
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent dist/OcrProofreadingTool.app OcrProofreadingTool-${{ matrix.name }}.zip
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OcrProofreadingTool-${{ matrix.name }}
+          path: |
+            OcrProofreadingTool-${{ matrix.name }}.zip
+            OcrProofreadingTool-${{ matrix.name }}.tar.gz
+          if-no-files-found: error
+
+    release:
+    name: Create GitHub Draft Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-files
+          merge-multiple: true
+
+      - name: List files
+        run: ls -la release-files
+
+      - name: Create GitHub Draft Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          name: ${{ github.ref_name }}
+          files: release-files/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
